@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>My Book Library</title>
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#f5f2ee">
+<meta name="mobile-web-app-capable" content="yes">
+
+<!-- iOS specific -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="My Library">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+<!-- Safe area for iPhone notch/Dynamic Island -->
+<style>
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script>
+// Suppress Babel in-browser transformer warning before Babel loads
+const _warn = console.warn.bind(console);
+console.warn = (...args) => {
+  if (args[0] && typeof args[0] === 'string' && args[0].includes('Babel')) return;
+  _warn(...args);
+};
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #f0ede8; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #f0ede8; } ::-webkit-scrollbar-thumb { background: #ccc8c0; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react,env">
+const { useState, useMemo, useRef, useEffect } = React;
+
+// ── Supabase ──
+const SUPA_URL = "https://kghwmhmcinervgziwpdk.supabase.co";
+const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtnaHdtaG1jaW5lcnZneml3cGRrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwMTk1ODYsImV4cCI6MjA4ODU5NTU4Nn0.NdnNahnTtknJE_aM9CC8Py6N-17v9sQIzMzHDv9PpqQ";
+const supabase = window.supabase.createClient(SUPA_URL, SUPA_KEY);
+
+async function loadStates(userId) {
+  const { data, error } = await supabase.from('book_states').select('*').eq('user_id', userId);
+  if (error) { console.error('loadStates:', error); return {}; }
+  const map = {};
+  (data || []).forEach(r => { map[r.book_id] = r; });
+  return map;
+}
+
+async function saveState(userId, bookId, read, wishlist, rating, extraData) {
+  await supabase.from('book_states').upsert({
+    user_id: userId,
+    book_id: String(bookId),
+    read, wishlist, rating,
+    extra_data: extraData || null,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'book_id,user_id' });
+}
+
+async function deleteState(userId, bookId) {
+  await supabase.from('book_states').delete().eq('user_id', userId).eq('book_id', String(bookId));
+}
+
+// ── Claude API ──
+function getApiKey() { return window._claudeApiKey || localStorage.getItem('claude_api_key') || ''; }
+
+async function callClaude(prompt, maxTokens = 1000) {
+  const apiKey = getApiKey();
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+    headers["anthropic-dangerous-direct-browser-access"] = "true";
+  }
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const rawText = await response.text();
+  let data;
+  try { data = JSON.parse(rawText); }
+  catch(e) { throw new Error("Status " + response.status + ": " + rawText.slice(0,150)); }
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  if (!data.content) throw new Error("No content field. Got: " + Object.keys(data).join(", "));
+  return data.content.map(b => b.text || "").join("").trim();
+}
+
+const CATEGORIES = [
+  { id: "vince_flynn",      label: "Vince Flynn",      emoji: "🎯" },
+  { id: "kyle_mills",       label: "Kyle Mills",       emoji: "🗡️" },
+  { id: "brad_thor",        label: "Brad Thor",        emoji: "🦅" },
+  { id: "mark_greaney",     label: "Mark Greaney",     emoji: "👁️" },
+  { id: "jack_carr",        label: "Jack Carr",        emoji: "🔱" },
+  { id: "michael_connelly", label: "M. Connelly",      emoji: "🔍" },
+  { id: "harlan_coben",     label: "Harlan Coben",     emoji: "🕵️" },
+  { id: "david_baldacci",   label: "D. Baldacci",      emoji: "💼" },
+  { id: "indian",           label: "Indian Books",     emoji: "🇮🇳" },
+  { id: "spy_espionage",    label: "Spy & Espionage",  emoji: "🔐" },
+  { id: "british_thriller", label: "British & Other",  emoji: "🇬🇧" },
+  { id: "nonfiction",       label: "Non-Fiction",      emoji: "📚" },
+  { id: "self_help",        label: "Self-Help",        emoji: "💡" },
+];
+const CAT_COLORS = {
+  vince_flynn:      { bg:"#f5eeee", border:"#d4b8b5", accent:"#7a3530", tag:"#e8d5d3", tagText:"#5c2420" },
+  kyle_mills:       { bg:"#f5eef0", border:"#d4b0b8", accent:"#6a2040", tag:"#e8d0d8", tagText:"#4e1430" },
+  brad_thor:        { bg:"#f0eef5", border:"#bab0d4", accent:"#3a2870", tag:"#d5d0ea", tagText:"#281858" },
+  mark_greaney:     { bg:"#eef2f5", border:"#b0c0d4", accent:"#1a3a5a", tag:"#d0dcea", tagText:"#102840" },
+  jack_carr:        { bg:"#eef5f0", border:"#b0d0b8", accent:"#1a4a2a", tag:"#d0e8d5", tagText:"#0e3018" },
+  michael_connelly: { bg:"#edf0f7", border:"#b8c2d8", accent:"#283a6a", tag:"#d5daea", tagText:"#1a2750" },
+  harlan_coben:     { bg:"#f2ecf7", border:"#c8b0d5", accent:"#52257a", tag:"#e0d0ec", tagText:"#3c1a5c" },
+  david_baldacci:   { bg:"#ecf4ec", border:"#b0ccb0", accent:"#28502a", tag:"#d0e5d0", tagText:"#1c3a1e" },
+  indian:           { bg:"#f5efea", border:"#cdb898", accent:"#6a4015", tag:"#e5d4b8", tagText:"#4e2e0c" },
+  spy_espionage:    { bg:"#ededee", border:"#b5bec2", accent:"#32424a", tag:"#d5dadc", tagText:"#222e34" },
+  british_thriller: { bg:"#e8f2f0", border:"#98c4bc", accent:"#165248", tag:"#c0deda", tagText:"#0c3830" },
+  nonfiction:       { bg:"#eeecf5", border:"#bcb0d0", accent:"#342058", tag:"#d8d0e8", tagText:"#241440" },
+  self_help:        { bg:"#f5ecec", border:"#ccb0b0", accent:"#6a2828", tag:"#e5cbcb", tagText:"#4e1818" },
+};
+const GENRES = ["CIA Thriller","Military Thriller","Spy Thriller","Crime / Detective","Psychological Thriller","Political Thriller","Espionage","Indian Fiction","British Thriller","Non-Fiction","Self-Help"];
+
+const MOOD_COLORS = {
+  "Action-Packed": { bg:"#f5eeee", accent:"#7a3530" },
+  "Psychological":  { bg:"#f2ecf7", accent:"#52257a" },
+  "Historical":     { bg:"#f5efea", accent:"#6a4015" },
+  "Literary":       { bg:"#ecf4ec", accent:"#28502a" },
+  "Procedural":     { bg:"#edf0f7", accent:"#283a6a" },
+  "Political":      { bg:"#eeecf5", accent:"#342058" },
+};
+const LIBRARY_PROFILE = {
+  series: ["Mitch Rapp","Scot Harvath","Gray Man","Harry Bosch","Mickey Haller","Myron Bolitar","Amos Decker","Gabriel Allon"],
+  themes: ["CIA/Intelligence","Assassins","Legal Drama","Cold Case","Espionage","Military","Indian History","Political Conspiracy"],
+};
+const REC_PROMPT = `You are a literary recommendation expert for thriller fiction.
+Reader preferences: Mitch Rapp (Vince Flynn/Kyle Mills), Scot Harvath (Brad Thor), Gray Man (Mark Greaney), Harry Bosch/Mickey Haller (Michael Connelly), Myron Bolitar (Harlan Coben), Amos Decker (David Baldacci), Gabriel Allon (Daniel Silva). Also Indian literature, WWII history, political biographies.
+Return ONLY a raw JSON object, no markdown, no backticks, no explanation. Structure:
+{"headline":"6-8 word punchy headline","picks":[{"title":"","author":"","year":2023,"rating":4.4,"genre":"","nyt":true,"why":"max 18 words why it fits","series":null,"mood":"Action-Packed","cat":"spy_espionage"}],"spotlightAuthor":{"name":"","why":"two sentences","mustRead":"","booksCount":12}}
+Exactly 8 picks rated 4.0+. Mix: 3 recent (2022-2025), 3 classics not in library, 2 Indian/nonfiction. mood must be one of: Action-Packed, Psychological, Historical, Literary, Procedural, Political. cat must be one of: vince_flynn, michael_connelly, harlan_coben, david_baldacci, indian, spy_espionage, british_thriller, nonfiction, self_help. Do NOT suggest: Vince Flynn, Kyle Mills, Brad Thor, Mark Greaney, Michael Connelly, Harlan Coben, David Baldacci.`;
+
+function getTwoDayWindow() {
+  const epoch = Math.floor(Date.now() / (1000*60*60*48));
+  return { seed: epoch, nextRefresh: new Date((epoch+1)*1000*60*60*48) };
+}
+const ALL_BOOKS = [
+  // VINCE FLYNN / BRAD THOR / MARK GREANEY / JACK CARR
+  { id:1,   cat:"vince_flynn", genre:"CIA Thriller", title:"Term Limits",          author:"Vince Flynn",  year:1997, rating:4.3, nyt:true,  tags:["Mitch Rapp","CIA","Political"] },
+  { id:2,   cat:"vince_flynn", genre:"CIA Thriller", title:"Transfer of Power",    author:"Vince Flynn",  year:1999, rating:4.4, nyt:true,  tags:["Mitch Rapp","White House","Terrorism"] },
+  { id:3,   cat:"vince_flynn", genre:"CIA Thriller", title:"The Third Option",     author:"Vince Flynn",  year:2000, rating:4.3, nyt:true,  tags:["Mitch Rapp","CIA","Action"] },
+  { id:4,   cat:"vince_flynn", genre:"CIA Thriller", title:"Separation of Power",  author:"Vince Flynn",  year:2001, rating:4.3, nyt:true,  tags:["Mitch Rapp","CIA","Nuclear"] },
+  { id:5,   cat:"vince_flynn", genre:"CIA Thriller", title:"Blowback",             author:"Vince Flynn",  year:2002, rating:4.2, nyt:true,  tags:["Mitch Rapp","CIA","Action"] },
+  { id:6,   cat:"brad_thor", genre:"Military Thriller", title:"The Lions of Lucerne", author:"Brad Thor",    year:2002, rating:4.2, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:7,   cat:"vince_flynn", genre:"CIA Thriller", title:"Executive Power",      author:"Vince Flynn",  year:2003, rating:4.2, nyt:true,  tags:["Mitch Rapp","CIA","Action"] },
+  { id:8,   cat:"brad_thor", genre:"Military Thriller", title:"Path of the Assassin", author:"Brad Thor",    year:2003, rating:4.1, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:9,   cat:"vince_flynn", genre:"CIA Thriller", title:"Memorial Day",         author:"Vince Flynn",  year:2004, rating:4.2, nyt:true,  tags:["Mitch Rapp","Nuclear Threat","Terrorism"] },
+  { id:10,  cat:"vince_flynn", genre:"CIA Thriller", title:"Consent to Kill",      author:"Vince Flynn",  year:2005, rating:4.3, nyt:true,  tags:["Mitch Rapp","Revenge","CIA"] },
+  { id:11,  cat:"vince_flynn", genre:"CIA Thriller", title:"Act of Treason",       author:"Vince Flynn",  year:2006, rating:4.2, nyt:true,  tags:["Mitch Rapp","Election","CIA"] },
+  { id:12,  cat:"vince_flynn", genre:"CIA Thriller", title:"Protect and Defend",   author:"Vince Flynn",  year:2007, rating:4.2, nyt:true,  tags:["Mitch Rapp","Iran","CIA"] },
+  { id:13,  cat:"brad_thor", genre:"Military Thriller", title:"The First Commandment",author:"Brad Thor",    year:2007, rating:4.1, nyt:true,  tags:["Scot Harvath","Revenge","CIA"] },
+  { id:14,  cat:"vince_flynn", genre:"CIA Thriller", title:"Extreme Measures",     author:"Vince Flynn",  year:2008, rating:4.2, nyt:true,  tags:["Mitch Rapp","Terrorism","CIA"] },
+  { id:15,  cat:"brad_thor", genre:"Military Thriller", title:"The Last Patriot",     author:"Brad Thor",    year:2008, rating:4.1, nyt:true,  tags:["Scot Harvath","Islam","CIA"] },
+  { id:16,  cat:"mark_greaney", genre:"Spy Thriller", title:"The Gray Man",         author:"Mark Greaney", year:2009, rating:4.2, nyt:false, tags:["Gray Man","CIA","Netflix"] },
+  { id:17,  cat:"vince_flynn", genre:"CIA Thriller", title:"Pursuit of Honor",     author:"Vince Flynn",  year:2009, rating:4.2, nyt:true,  tags:["Mitch Rapp","CIA","Action"] },
+  { id:18,  cat:"brad_thor", genre:"Military Thriller", title:"The Apostle",          author:"Brad Thor",    year:2009, rating:4.1, nyt:true,  tags:["Scot Harvath","Afghanistan","CIA"] },
+  { id:19,  cat:"vince_flynn", genre:"CIA Thriller", title:"American Assassin",    author:"Vince Flynn",  year:2010, rating:4.3, nyt:true,  tags:["Mitch Rapp","Origin","CIA"] },
+  { id:20,  cat:"brad_thor", genre:"Military Thriller", title:"Foreign Influence",    author:"Brad Thor",    year:2010, rating:4.1, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:21,  cat:"mark_greaney", genre:"Spy Thriller", title:"Ballistic",            author:"Mark Greaney", year:2011, rating:4.1, nyt:false, tags:["Gray Man","Mexico","CIA"] },
+  { id:22,  cat:"brad_thor", genre:"Military Thriller", title:"Full Black",           author:"Brad Thor",    year:2011, rating:4.1, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:23,  cat:"vince_flynn", genre:"CIA Thriller", title:"Kill Shot",            author:"Vince Flynn",  year:2012, rating:4.2, nyt:true,  tags:["Mitch Rapp","CIA","Prequel"] },
+  { id:24,  cat:"vince_flynn", genre:"CIA Thriller", title:"The Last Man",         author:"Vince Flynn",  year:2012, rating:4.2, nyt:true,  tags:["Mitch Rapp","Afghanistan","CIA"] },
+  { id:25,  cat:"brad_thor", genre:"Military Thriller", title:"Free Fall",            author:"Brad Thor",    year:2013, rating:4.0, nyt:false, tags:["Scot Harvath","Short","Prequel"] },
+  { id:26,  cat:"brad_thor", genre:"Military Thriller", title:"Hidden Order",         author:"Brad Thor",    year:2013, rating:4.2, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:27,  cat:"brad_thor", genre:"Military Thriller", title:"Act of War",           author:"Brad Thor",    year:2014, rating:4.2, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:28,  cat:"mark_greaney", genre:"Spy Thriller", title:"Dead Eye",             author:"Mark Greaney", year:2014, rating:4.2, nyt:true,  tags:["Gray Man","CIA","Sniper"] },
+  { id:29,  cat:"mark_greaney", genre:"Spy Thriller", title:"In the Blood",         author:"Mark Greaney", year:2014, rating:4.2, nyt:true,  tags:["Gray Man","CIA","Action"] },
+  { id:30,  cat:"kyle_mills", genre:"CIA Thriller", title:"The Survivor",         author:"Kyle Mills",   year:2015, rating:4.1, nyt:true,  tags:["Mitch Rapp","ISIS","CIA"] },
+  { id:31,  cat:"brad_thor", genre:"Military Thriller", title:"Back Blast",           author:"Brad Thor",    year:2016, rating:4.2, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:32,  cat:"kyle_mills", genre:"CIA Thriller", title:"Order to Kill",        author:"Kyle Mills",   year:2016, rating:4.1, nyt:true,  tags:["Mitch Rapp","Pakistan","CIA"] },
+  { id:33,  cat:"brad_thor", genre:"Military Thriller", title:"Deep State",           author:"Brad Thor",    year:2017, rating:4.2, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:34,  cat:"kyle_mills", genre:"CIA Thriller", title:"Enemy of the State",   author:"Kyle Mills",   year:2017, rating:4.1, nyt:true,  tags:["Mitch Rapp","Saudi Arabia","CIA"] },
+  { id:35,  cat:"mark_greaney", genre:"Spy Thriller", title:"Gunmetal Gray",        author:"Mark Greaney", year:2017, rating:4.3, nyt:true,  tags:["Gray Man","CIA","Action"] },
+  { id:36,  cat:"mark_greaney", genre:"Spy Thriller", title:"Agent in Place",       author:"Mark Greaney", year:2018, rating:4.3, nyt:true,  tags:["Gray Man","CIA","Syria"] },
+  { id:37,  cat:"kyle_mills", genre:"CIA Thriller", title:"Red War",              author:"Kyle Mills",   year:2018, rating:4.1, nyt:true,  tags:["Mitch Rapp","Russia","CIA"] },
+  { id:38,  cat:"jack_carr", genre:"Military Thriller", title:"The Terminal List",    author:"Jack Carr",    year:2018, rating:4.4, nyt:true,  tags:["James Reece","Navy SEAL","Revenge"] },
+  { id:39,  cat:"kyle_mills", genre:"CIA Thriller", title:"Lethal Agent",         author:"Kyle Mills",   year:2019, rating:4.1, nyt:true,  tags:["Mitch Rapp","Bioweapon","CIA"] },
+  { id:40,  cat:"mark_greaney", genre:"Spy Thriller", title:"Mission Critical",     author:"Mark Greaney", year:2019, rating:4.3, nyt:true,  tags:["Gray Man","CIA","Action"] },
+  { id:41,  cat:"mark_greaney", genre:"Spy Thriller", title:"Savage Son",           author:"Mark Greaney", year:2019, rating:4.2, nyt:true,  tags:["Gray Man","Russia","CIA"] },
+  { id:42,  cat:"brad_thor", genre:"Military Thriller", title:"True Believer",        author:"Brad Thor",    year:2019, rating:4.3, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:43,  cat:"mark_greaney", genre:"Spy Thriller", title:"One Minute Out",       author:"Mark Greaney", year:2020, rating:4.3, nyt:true,  tags:["Gray Man","CIA","Action"] },
+  { id:44,  cat:"brad_thor", genre:"Military Thriller", title:"Storm Rising",         author:"Brad Thor",    year:2020, rating:4.1, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:45,  cat:"kyle_mills", genre:"CIA Thriller", title:"Total Power",          author:"Kyle Mills",   year:2020, rating:4.2, nyt:true,  tags:["Mitch Rapp","Grid Attack","CIA"] },
+  { id:46,  cat:"kyle_mills", genre:"CIA Thriller", title:"Enemy at the Gates",   author:"Kyle Mills",   year:2021, rating:4.1, nyt:true,  tags:["Mitch Rapp","Russia","CIA"] },
+  { id:47,  cat:"brad_thor", genre:"Military Thriller", title:"Relentless",           author:"Brad Thor",    year:2021, rating:4.1, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+  { id:48,  cat:"brad_thor", genre:"Military Thriller", title:"Ninety Days",          author:"Brad Thor",    year:2022, rating:4.0, nyt:false, tags:["Scot Harvath","Short Story","CIA"] },
+  { id:49,  cat:"mark_greaney", genre:"Spy Thriller", title:"Sierra Six",           author:"Mark Greaney", year:2022, rating:4.2, nyt:true,  tags:["Gray Man","CIA","Origin"] },
+  { id:50,  cat:"brad_thor", genre:"Military Thriller", title:"Wolf Trap",            author:"Brad Thor",    year:2022, rating:4.2, nyt:true,  tags:["Scot Harvath","Russia","CIA"] },
+  { id:51,  cat:"mark_greaney", genre:"Spy Thriller", title:"Burner",               author:"Mark Greaney", year:2023, rating:4.2, nyt:true,  tags:["Gray Man","CIA","Action"] },
+  { id:52,  cat:"kyle_mills", genre:"CIA Thriller", title:"Code Red",             author:"Kyle Mills",   year:2023, rating:4.1, nyt:true,  tags:["Mitch Rapp","Bioweapon","CIA"] },
+  { id:53,  cat:"brad_thor", genre:"Military Thriller", title:"Oath of Loyalty",      author:"Brad Thor",    year:2023, rating:4.2, nyt:true,  tags:["Scot Harvath","CIA","Action"] },
+
+  // MICHAEL CONNELLY
+  { id:101, cat:"michael_connelly", genre:"Crime / Detective", title:"The Black Echo",       author:"Michael Connelly", year:1992, rating:4.2, nyt:false, tags:["Harry Bosch","LAPD","Edgar Award"] },
+  { id:102, cat:"michael_connelly", genre:"Crime / Detective", title:"The Black Ice",        author:"Michael Connelly", year:1993, rating:4.1, nyt:false, tags:["Harry Bosch","LAPD","Drugs"] },
+  { id:103, cat:"michael_connelly", genre:"Crime / Detective", title:"The Concrete Blonde",  author:"Michael Connelly", year:1994, rating:4.2, nyt:false, tags:["Harry Bosch","Serial Killer","LAPD"] },
+  { id:104, cat:"michael_connelly", genre:"Crime / Detective", title:"The Last Coyote",      author:"Michael Connelly", year:1995, rating:4.2, nyt:false, tags:["Harry Bosch","Cold Case","LAPD"] },
+  { id:105, cat:"michael_connelly", genre:"Crime / Detective", title:"The Poet",             author:"Michael Connelly", year:1996, rating:4.3, nyt:true,  tags:["Standalone","Serial Killer","Journalist"] },
+  { id:106, cat:"michael_connelly", genre:"Crime / Detective", title:"The Lincoln Lawyer",   author:"Michael Connelly", year:2005, rating:4.2, nyt:true,  tags:["Mickey Haller","Legal Thriller","Netflix"] },
+  { id:107, cat:"michael_connelly", genre:"Crime / Detective", title:"The Brass Verdict",    author:"Michael Connelly", year:2008, rating:4.2, nyt:true,  tags:["Mickey Haller","Bosch","Legal"] },
+  { id:108, cat:"michael_connelly", genre:"Crime / Detective", title:"The Reversal",         author:"Michael Connelly", year:2010, rating:4.1, nyt:true,  tags:["Mickey Haller","Bosch","Legal"] },
+  { id:109, cat:"michael_connelly", genre:"Crime / Detective", title:"The Fifth Witness",    author:"Michael Connelly", year:2011, rating:4.1, nyt:true,  tags:["Mickey Haller","Legal","Foreclosure"] },
+  { id:110, cat:"michael_connelly", genre:"Crime / Detective", title:"The Gods of Guilt",    author:"Michael Connelly", year:2013, rating:4.1, nyt:true,  tags:["Mickey Haller","Legal","Murder"] },
+  { id:111, cat:"michael_connelly", genre:"Crime / Detective", title:"Triptych",             author:"Michael Connelly", year:2006, rating:4.1, nyt:true,  tags:["Bosch","McEvoy","Standalone"] },
+  { id:112, cat:"michael_connelly", genre:"Crime / Detective", title:"The Whistler",         author:"Michael Connelly", year:2016, rating:4.1, nyt:true,  tags:["Jack McEvoy","Corruption","FBI"] },
+  { id:113, cat:"michael_connelly", genre:"Crime / Detective", title:"The Late Show",        author:"Michael Connelly", year:2017, rating:4.1, nyt:true,  tags:["Renée Ballard","LAPD","Nightshift"] },
+  { id:114, cat:"michael_connelly", genre:"Crime / Detective", title:"Dark Hours",           author:"Michael Connelly", year:2018, rating:4.1, nyt:true,  tags:["Renée Ballard","Bosch","LAPD"] },
+  { id:115, cat:"michael_connelly", genre:"Crime / Detective", title:"The Night Fire",       author:"Michael Connelly", year:2019, rating:4.2, nyt:true,  tags:["Bosch","Ballard","Cold Case"] },
+  { id:116, cat:"michael_connelly", genre:"Crime / Detective", title:"The Last Trial",       author:"Michael Connelly", year:2020, rating:4.1, nyt:true,  tags:["Mickey Haller","Legal","Final"] },
+  { id:117, cat:"michael_connelly", genre:"Crime / Detective", title:"The Law of Innocence", author:"Michael Connelly", year:2020, rating:4.1, nyt:true,  tags:["Mickey Haller","Legal","Prison"] },
+  { id:118, cat:"michael_connelly", genre:"Crime / Detective", title:"Desert Star",          author:"Michael Connelly", year:2022, rating:4.1, nyt:true,  tags:["Bosch","Ballard","Cold Case"] },
+  { id:119, cat:"michael_connelly", genre:"Crime / Detective", title:"Resurrection Walk",    author:"Michael Connelly", year:2023, rating:4.2, nyt:true,  tags:["Mickey Haller","Ballard","Legal"] },
+  { id:120, cat:"michael_connelly", genre:"Crime / Detective", title:"The Proving Ground",   author:"Michael Connelly", year:2024, rating:4.2, nyt:true,  tags:["Mickey Haller","Legal","New"] },
+  { id:121, cat:"michael_connelly", genre:"Crime / Detective", title:"The Rainmaker",        author:"John Grisham",     year:1995, rating:4.1, nyt:true,  tags:["Legal Thriller","Insurance","Classic"] },
+  { id:122, cat:"michael_connelly", genre:"Crime / Detective", title:"The Runaway Jury",     author:"John Grisham",     year:1996, rating:4.2, nyt:true,  tags:["Jury Thriller","Legal","Classic"] },
+
+  // HARLAN COBEN
+  { id:201, cat:"harlan_coben", genre:"Psychological Thriller", title:"Deal Breaker",        author:"Harlan Coben", year:1995, rating:4.0, nyt:false, tags:["Myron Bolitar","Sports Agent","Mystery"] },
+  { id:202, cat:"harlan_coben", genre:"Psychological Thriller", title:"Drop Shot",           author:"Harlan Coben", year:1996, rating:4.0, nyt:false, tags:["Myron Bolitar","Tennis","Mystery"] },
+  { id:203, cat:"harlan_coben", genre:"Psychological Thriller", title:"Fade Away",           author:"Harlan Coben", year:1996, rating:4.0, nyt:false, tags:["Myron Bolitar","Basketball","Mystery"] },
+  { id:204, cat:"harlan_coben", genre:"Psychological Thriller", title:"Back Spin",           author:"Harlan Coben", year:1997, rating:4.0, nyt:false, tags:["Myron Bolitar","Golf","Mystery"] },
+  { id:205, cat:"harlan_coben", genre:"Psychological Thriller", title:"Tell No One",         author:"Harlan Coben", year:2001, rating:4.2, nyt:true,  tags:["Standalone","Psychological","Netflix"] },
+  { id:206, cat:"harlan_coben", genre:"Psychological Thriller", title:"Gone for Good",       author:"Harlan Coben", year:2002, rating:4.1, nyt:true,  tags:["Standalone","Psychological","Mystery"] },
+  { id:207, cat:"harlan_coben", genre:"Psychological Thriller", title:"No Second Chance",    author:"Harlan Coben", year:2003, rating:4.1, nyt:true,  tags:["Standalone","Kidnap","Suspense"] },
+  { id:208, cat:"harlan_coben", genre:"Psychological Thriller", title:"The Woods",           author:"Harlan Coben", year:2007, rating:4.1, nyt:true,  tags:["Standalone","Cold Case","Psychological"] },
+  { id:209, cat:"harlan_coben", genre:"Psychological Thriller", title:"Bloody Valentine",    author:"Harlan Coben", year:2010, rating:3.9, nyt:false, tags:["Myron Bolitar","Short Story","Mystery"] },
+  { id:210, cat:"harlan_coben", genre:"Psychological Thriller", title:"Live Wire",           author:"Harlan Coben", year:2011, rating:4.0, nyt:true,  tags:["Myron Bolitar","Family","Mystery"] },
+  { id:211, cat:"harlan_coben", genre:"Psychological Thriller", title:"Stay Close",          author:"Harlan Coben", year:2012, rating:4.0, nyt:true,  tags:["Standalone","Secrets","Netflix"] },
+  { id:212, cat:"harlan_coben", genre:"Psychological Thriller", title:"Missing You",         author:"Harlan Coben", year:2014, rating:4.0, nyt:true,  tags:["Standalone","Online Dating","Mystery"] },
+  { id:213, cat:"harlan_coben", genre:"Psychological Thriller", title:"The Stranger",        author:"Harlan Coben", year:2015, rating:4.0, nyt:true,  tags:["Standalone","Domestic","Netflix"] },
+  { id:214, cat:"harlan_coben", genre:"Psychological Thriller", title:"Fool Me Once",        author:"Harlan Coben", year:2016, rating:4.0, nyt:true,  tags:["Standalone","Grief","Netflix"] },
+  { id:215, cat:"harlan_coben", genre:"Psychological Thriller", title:"Don't Let Go",        author:"Harlan Coben", year:2017, rating:4.0, nyt:true,  tags:["Standalone","Detective","Suspense"] },
+  { id:216, cat:"harlan_coben", genre:"Psychological Thriller", title:"Run Away",            author:"Harlan Coben", year:2019, rating:4.0, nyt:true,  tags:["Standalone","Missing Child","Suspense"] },
+  { id:217, cat:"harlan_coben", genre:"Psychological Thriller", title:"The Boy from the Woods", author:"Harlan Coben", year:2020, rating:4.0, nyt:true, tags:["Standalone","Mystery","Missing"] },
+  { id:218, cat:"harlan_coben", genre:"Psychological Thriller", title:"Win",                 author:"Harlan Coben", year:2021, rating:4.1, nyt:true,  tags:["Windsor Lockwood","Mystery","Thriller"] },
+  { id:219, cat:"harlan_coben", genre:"Psychological Thriller", title:"Over My Dead Body",   author:"Harlan Coben", year:2022, rating:4.0, nyt:true,  tags:["Myron Bolitar","Win","Return"] },
+  { id:220, cat:"harlan_coben", genre:"Psychological Thriller", title:"Cat and Mouse",       author:"Harlan Coben", year:2022, rating:3.9, nyt:false, tags:["Myron Bolitar","Short Story","Mystery"] },
+  { id:221, cat:"harlan_coben", genre:"Psychological Thriller", title:"Turn a Blind Eye",    author:"Harlan Coben", year:2023, rating:4.0, nyt:true,  tags:["Standalone","Thriller","Netflix"] },
+  { id:222, cat:"harlan_coben", genre:"Psychological Thriller", title:"I Will Find You",     author:"Harlan Coben", year:2023, rating:4.1, nyt:true,  tags:["Standalone","Prison","Suspense"] },
+  { id:223, cat:"harlan_coben", genre:"Psychological Thriller", title:"Think Twice",         author:"Harlan Coben", year:2024, rating:4.1, nyt:true,  tags:["Myron Bolitar","Return","Thriller"] },
+
+  // DAVID BALDACCI
+  { id:301, cat:"david_baldacci", genre:"Political Thriller", title:"Absolute Power",     author:"David Baldacci", year:1996, rating:4.2, nyt:true,  tags:["Standalone","Political","President"] },
+  { id:302, cat:"david_baldacci", genre:"Political Thriller", title:"The Simple Truth",   author:"David Baldacci", year:1998, rating:4.0, nyt:true,  tags:["Standalone","Legal","Military"] },
+  { id:303, cat:"david_baldacci", genre:"Political Thriller", title:"The Camel Club",     author:"David Baldacci", year:2005, rating:4.1, nyt:true,  tags:["Camel Club","Conspiracy","Washington"] },
+  { id:304, cat:"david_baldacci", genre:"Political Thriller", title:"The Collectors",     author:"David Baldacci", year:2006, rating:4.1, nyt:true,  tags:["Camel Club","Conspiracy","Washington"] },
+  { id:305, cat:"david_baldacci", genre:"Political Thriller", title:"Stone Cold",         author:"David Baldacci", year:2007, rating:4.1, nyt:true,  tags:["Camel Club","Conspiracy","Action"] },
+  { id:306, cat:"david_baldacci", genre:"Political Thriller", title:"Divine Justice",     author:"David Baldacci", year:2008, rating:4.0, nyt:true,  tags:["Camel Club","John Carr","Action"] },
+  { id:307, cat:"david_baldacci", genre:"Political Thriller", title:"The Innocent",       author:"David Baldacci", year:2012, rating:4.2, nyt:true,  tags:["Will Robie","Assassin","Action"] },
+  { id:308, cat:"david_baldacci", genre:"Political Thriller", title:"The Hit",            author:"David Baldacci", year:2013, rating:4.2, nyt:true,  tags:["Will Robie","Assassin","Action"] },
+  { id:309, cat:"david_baldacci", genre:"Political Thriller", title:"The Target",         author:"David Baldacci", year:2014, rating:4.1, nyt:true,  tags:["Will Robie","North Korea","Action"] },
+  { id:310, cat:"david_baldacci", genre:"Political Thriller", title:"Memory Man",         author:"David Baldacci", year:2015, rating:4.2, nyt:true,  tags:["Amos Decker","Perfect Recall","Crime"] },
+  { id:311, cat:"david_baldacci", genre:"Political Thriller", title:"The Last Mile",      author:"David Baldacci", year:2016, rating:4.1, nyt:true,  tags:["Amos Decker","Perfect Recall","Death Row"] },
+  { id:312, cat:"david_baldacci", genre:"Political Thriller", title:"The Fix",            author:"David Baldacci", year:2017, rating:4.1, nyt:true,  tags:["Amos Decker","FBI","Murder"] },
+  { id:313, cat:"david_baldacci", genre:"Political Thriller", title:"The Fallen",         author:"David Baldacci", year:2018, rating:4.1, nyt:true,  tags:["Amos Decker","Opioids","Crime"] },
+  { id:314, cat:"david_baldacci", genre:"Political Thriller", title:"Long Road to Mercy", author:"David Baldacci", year:2018, rating:4.0, nyt:true,  tags:["Amos Decker","Grand Canyon","FBI"] },
+  { id:315, cat:"david_baldacci", genre:"Political Thriller", title:"Redemption",         author:"David Baldacci", year:2019, rating:4.1, nyt:true,  tags:["Amos Decker","Cold Case","FBI"] },
+  { id:316, cat:"david_baldacci", genre:"Political Thriller", title:"Walk the Wire",      author:"David Baldacci", year:2020, rating:4.0, nyt:true,  tags:["Amos Decker","Oil Fields","FBI"] },
+  { id:317, cat:"david_baldacci", genre:"Political Thriller", title:"Long Shadows",       author:"David Baldacci", year:2022, rating:4.0, nyt:true,  tags:["Amos Decker","Florida","FBI"] },
+  { id:318, cat:"david_baldacci", genre:"Political Thriller", title:"A Calamity of Souls",author:"David Baldacci", year:2024, rating:4.3, nyt:true,  tags:["Legal Thriller","Civil Rights","Drama"] },
+
+  // INDIAN BOOKS
+  { id:401, cat:"indian", genre:"Indian Fiction", title:"Khasakkinte Ithihasam",            author:"O.V. Vijayan",       year:1969, rating:4.5, nyt:false, tags:["Malayalam","Classic","Literary"] },
+  { id:402, cat:"indian", genre:"Indian Fiction", title:"Indira",                           author:"Pupul Jayakar",      year:1992, rating:4.1, nyt:false, tags:["Biography","Indira Gandhi","Politics"] },
+  { id:403, cat:"indian", genre:"Indian Fiction", title:"Wings of Fire",                    author:"APJ Abdul Kalam",    year:1999, rating:4.6, nyt:false, tags:["Autobiography","ISRO","Inspirational"] },
+  { id:404, cat:"indian", genre:"Indian Fiction", title:"The Rozabal Line",                 author:"Ashwin Sanghi",      year:2008, rating:4.1, nyt:false, tags:["Thriller","Conspiracy","Kashmir"] },
+  { id:405, cat:"indian", genre:"Indian Fiction", title:"Aatujeevitham",                    author:"Benyamin",           year:2008, rating:4.7, nyt:false, tags:["Malayalam","Literary","Survival"] },
+  { id:406, cat:"indian", genre:"Indian Fiction", title:"The Dirty Dozen",                  author:"S. Hussain Zaidi",   year:2012, rating:4.0, nyt:false, tags:["Mumbai","Crime","Underworld"] },
+  { id:407, cat:"indian", genre:"Indian Fiction", title:"My Name is Abu Salem",             author:"S. Hussain Zaidi",   year:2012, rating:4.0, nyt:false, tags:["Mumbai","Crime","True Story"] },
+  { id:408, cat:"indian", genre:"Indian Fiction", title:"A Season for Dying",               author:"Vikram Rana",        year:2015, rating:4.0, nyt:false, tags:["Vikram Rana","Hyderabad","Mystery"] },
+  { id:409, cat:"indian", genre:"Indian Fiction", title:"A Feast of Vultures",              author:"Josy Joseph",        year:2016, rating:4.2, nyt:false, tags:["Corruption","Democracy","Nonfiction"] },
+  { id:410, cat:"indian", genre:"Indian Fiction", title:"Behind the Scenes",                author:"Vikram Rana",        year:2016, rating:4.0, nyt:false, tags:["Vikram Rana","Hyderabad","Mystery"] },
+  { id:411, cat:"indian", genre:"Indian Fiction", title:"Sedition",                         author:"Bilal Siddiqi",      year:2016, rating:3.9, nyt:false, tags:["Indian Thriller","Political","Espionage"] },
+  { id:412, cat:"indian", genre:"Indian Fiction", title:"Vikram Rana Investigates",         author:"Vikram Rana",        year:2017, rating:4.0, nyt:false, tags:["Vikram Rana","Mystery","Hyderabad"] },
+  { id:413, cat:"indian", genre:"Indian Fiction", title:"Atal Bihari Vajpayee",             author:"Ullekh N.P.",        year:2017, rating:4.2, nyt:false, tags:["Biography","Politics","PM"] },
+  { id:414, cat:"indian", genre:"Indian Fiction", title:"A Century Is Not Enough",          author:"Sourav Ganguly",     year:2018, rating:4.2, nyt:false, tags:["Cricket","Autobiography","Sports"] },
+  { id:415, cat:"indian", genre:"Indian Fiction", title:"RN Kao",                           author:"Nitin Gokhale",      year:2019, rating:4.2, nyt:false, tags:["RAW","Espionage","Biography"] },
+  { id:416, cat:"indian", genre:"Indian Fiction", title:"RAW: A History",                   author:"Yatish Yadav",       year:2020, rating:4.1, nyt:false, tags:["RAW","Intelligence","Nonfiction"] },
+  { id:417, cat:"indian", genre:"Indian Fiction", title:"VP Menon",                         author:"Narayani Basu",      year:2020, rating:4.3, nyt:false, tags:["Biography","Partition","History"] },
+  { id:418, cat:"indian", genre:"Indian Fiction", title:"Despite the State",                author:"M. Rajshekhar",      year:2021, rating:4.1, nyt:false, tags:["India","Governance","Nonfiction"] },
+  { id:419, cat:"indian", genre:"Indian Fiction", title:"How Prime Ministers Decide",       author:"Neerja Chowdhury",   year:2022, rating:4.1, nyt:false, tags:["Politics","India","Nonfiction"] },
+  { id:420, cat:"indian", genre:"Indian Fiction", title:"India's Power Elite",              author:"Sanjaya Baru",       year:2022, rating:4.0, nyt:false, tags:["Politics","India","Nonfiction"] },
+  { id:421, cat:"indian", genre:"Indian Fiction", title:"A Thousand Scars: The Hunter",     author:"Unknown",            year:2022, rating:3.9, nyt:false, tags:["Indian Thriller","Action","Series"] },
+  { id:422, cat:"indian", genre:"Indian Fiction", title:"A Thousand Scars: The Hunted",     author:"Unknown",            year:2022, rating:3.9, nyt:false, tags:["Indian Thriller","Action","Series"] },
+  { id:423, cat:"indian", genre:"Indian Fiction", title:"An Indian Spy in Pakistan",        author:"M.K. Dhar",          year:2007, rating:4.0, nyt:false, tags:["RAW","Espionage","True Story"] },
+  { id:424, cat:"indian", genre:"Indian Fiction", title:"India After Gandhi",               author:"Ramachandra Guha",   year:2007, rating:4.5, nyt:false, tags:["History","Politics","Democracy"] },
+  { id:425, cat:"indian", genre:"Indian Fiction", title:"Field Marshal Sam Manekshaw",      author:"Depinder Singh",     year:2002, rating:4.3, nyt:false, tags:["Biography","Military","1971 War"] },
+
+  // SPY & ESPIONAGE
+  { id:501, cat:"spy_espionage", genre:"Espionage", title:"The Human Factor",          author:"Graham Greene",    year:1978, rating:4.0, nyt:false, tags:["Classic","Cold War","Spy Fiction"] },
+  { id:502, cat:"spy_espionage", genre:"Espionage", title:"The Matarese Circle",       author:"Robert Ludlum",    year:1979, rating:4.1, nyt:true,  tags:["Cold War","CIA","KGB"] },
+  { id:503, cat:"spy_espionage", genre:"Espionage", title:"A Look Over My Shoulder",   author:"Richard Helms",    year:2003, rating:4.1, nyt:false, tags:["CIA","Cold War","Memoir"] },
+  { id:504, cat:"spy_espionage", genre:"Espionage", title:"The Janson Directive",      author:"Robert Ludlum",    year:2002, rating:4.0, nyt:true,  tags:["Paul Janson","CIA","Action"] },
+  { id:505, cat:"spy_espionage", genre:"Espionage", title:"The Kill Artist",           author:"Daniel Silva",     year:2000, rating:4.2, nyt:true,  tags:["Gabriel Allon","Mossad","Art"] },
+  { id:506, cat:"spy_espionage", genre:"Espionage", title:"The English Assassin",      author:"Daniel Silva",     year:2002, rating:4.2, nyt:true,  tags:["Gabriel Allon","Mossad","Switzerland"] },
+  { id:507, cat:"spy_espionage", genre:"Espionage", title:"The Confessor",             author:"Daniel Silva",     year:2003, rating:4.1, nyt:true,  tags:["Gabriel Allon","Vatican","WWII"] },
+  { id:508, cat:"spy_espionage", genre:"Espionage", title:"A Death in Vienna",         author:"Daniel Silva",     year:2004, rating:4.1, nyt:true,  tags:["Gabriel Allon","Holocaust","Austria"] },
+  { id:509, cat:"spy_espionage", genre:"Espionage", title:"The Rogue Spy",             author:"Daniel Silva",     year:2011, rating:4.1, nyt:true,  tags:["Gabriel Allon","Mossad","Iran"] },
+  { id:510, cat:"spy_espionage", genre:"Espionage", title:"A Spy Among Friends",       author:"Ben Macintyre",    year:2014, rating:4.4, nyt:true,  tags:["Kim Philby","True Story","Cold War"] },
+  { id:511, cat:"spy_espionage", genre:"Espionage", title:"The Spy with 29 Names",     author:"Jason Webster",    year:2014, rating:4.1, nyt:false, tags:["WWII","Spy","True Story"] },
+  { id:512, cat:"spy_espionage", genre:"Espionage", title:"Countdown to Zero Day",     author:"Kim Zetter",       year:2014, rating:4.4, nyt:true,  tags:["Stuxnet","Cyber","Nonfiction"] },
+  { id:513, cat:"spy_espionage", genre:"Espionage", title:"The Presidents Book of Secrets", author:"David Priess", year:2016, rating:4.1, nyt:false, tags:["President","Intelligence","Nonfiction"] },
+  { id:514, cat:"spy_espionage", genre:"Espionage", title:"Deep Undercover",           author:"Jack Barsky",      year:2017, rating:4.2, nyt:false, tags:["KGB","Cold War","Memoir"] },
+  { id:515, cat:"spy_espionage", genre:"Espionage", title:"Rise and Kill First",       author:"Ronen Bergman",    year:2018, rating:4.5, nyt:true,  tags:["Mossad","Israel","Nonfiction"] },
+  { id:516, cat:"spy_espionage", genre:"Espionage", title:"Dark Mirror",               author:"Daniel Silva",     year:2020, rating:4.2, nyt:true,  tags:["Gabriel Allon","Disinformation","Russia"] },
+  { id:517, cat:"spy_espionage", genre:"Espionage", title:"Agent Sonya",               author:"Ben Macintyre",    year:2020, rating:4.3, nyt:true,  tags:["Soviet Spy","True Story","WWII"] },
+  { id:518, cat:"spy_espionage", genre:"Espionage", title:"The Spymasters",            author:"Chris Whipple",    year:2020, rating:4.2, nyt:true,  tags:["CIA","Directors","Nonfiction"] },
+  { id:519, cat:"spy_espionage", genre:"Espionage", title:"RAW Hitman",                author:"Unknown",          year:2021, rating:3.9, nyt:false, tags:["RAW","India","Espionage"] },
+  { id:520, cat:"spy_espionage", genre:"Espionage", title:"Dark Wire",                 author:"Unknown",          year:2022, rating:4.0, nyt:false, tags:["FBI","Drug Cartel","True Story"] },
+  { id:521, cat:"spy_espionage", genre:"Espionage", title:"Enemies: History of FBI",   author:"Tim Weiner",       year:2012, rating:4.2, nyt:true,  tags:["FBI","History","Nonfiction"] },
+  { id:522, cat:"spy_espionage", genre:"Espionage", title:"The CIA as Organized Crime", author:"Douglas Valentine", year:2017, rating:4.0, nyt:false, tags:["CIA","Dark Side","Nonfiction"] },
+  { id:523, cat:"spy_espionage", genre:"Espionage", title:"Billion Dollar Spy",        author:"David Hoffman",    year:2015, rating:4.3, nyt:true,  tags:["CIA","Cold War","True Story"] },
+
+  // BRITISH & OTHER THRILLERS
+  { id:601, cat:"british_thriller", genre:"British Thriller", title:"The Mysterious Affair at Styles", author:"Agatha Christie",  year:1920, rating:4.1, nyt:false, tags:["Poirot","Classic","Cozy"] },
+  { id:602, cat:"british_thriller", genre:"British Thriller", title:"Crime and Punishment",            author:"Dostoevsky",        year:1866, rating:4.2, nyt:false, tags:["Classic","Russian","Literary"] },
+  { id:603, cat:"british_thriller", genre:"British Thriller", title:"Presumed Innocent",               author:"Scott Turow",       year:1987, rating:4.1, nyt:true,  tags:["Legal Thriller","Classic","Murder"] },
+  { id:604, cat:"british_thriller", genre:"British Thriller", title:"Rules of Prey",                   author:"John Sandford",     year:1989, rating:4.1, nyt:true,  tags:["Lucas Davenport","Serial Killer","MN"] },
+  { id:605, cat:"british_thriller", genre:"British Thriller", title:"A Time to Kill",                  author:"John Grisham",      year:1989, rating:4.4, nyt:true,  tags:["Legal Thriller","Race","Mississippi"] },
+  { id:606, cat:"british_thriller", genre:"British Thriller", title:"The Generals Daughter",           author:"Nelson DeMille",    year:1992, rating:4.1, nyt:true,  tags:["Military","Murder","Investigation"] },
+  { id:607, cat:"british_thriller", genre:"British Thriller", title:"Jack Reacher: Killing Floor",     author:"Lee Child",         year:1997, rating:4.3, nyt:true,  tags:["Jack Reacher","Drifter","Action"] },
+  { id:608, cat:"british_thriller", genre:"British Thriller", title:"Sum of All Fears",                author:"Tom Clancy",        year:1991, rating:4.2, nyt:true,  tags:["Jack Ryan","Nuclear","Terrorism"] },
+  { id:609, cat:"british_thriller", genre:"British Thriller", title:"1st to Die",                      author:"James Patterson",   year:2001, rating:4.0, nyt:true,  tags:["Women's Murder Club","Serial Killer","FBI"] },
+  { id:610, cat:"british_thriller", genre:"British Thriller", title:"Jack & Jill",                     author:"James Patterson",   year:1996, rating:4.0, nyt:true,  tags:["Alex Cross","Serial Killer","President"] },
+  { id:611, cat:"british_thriller", genre:"British Thriller", title:"Rainbow Six",                     author:"Tom Clancy",        year:1998, rating:4.2, nyt:true,  tags:["Counter-Terror","Action","Military"] },
+  { id:612, cat:"british_thriller", genre:"British Thriller", title:"Mr. Mercedes",                    author:"Stephen King",      year:2014, rating:4.1, nyt:true,  tags:["Detective","Retired Cop","Thriller"] },
+  { id:613, cat:"british_thriller", genre:"British Thriller", title:"The President is Missing",        author:"Bill Clinton",      year:2018, rating:3.9, nyt:true,  tags:["Political","Cyber Terror","President"] },
+  { id:614, cat:"british_thriller", genre:"British Thriller", title:"The President's Daughter",        author:"James Patterson",   year:2021, rating:4.1, nyt:true,  tags:["Kidnap","President","Thriller"] },
+  { id:615, cat:"british_thriller", genre:"British Thriller", title:"Red Metal",                       author:"Mark Greaney",      year:2019, rating:4.1, nyt:true,  tags:["Military","Russia","NATO"] },
+  { id:616, cat:"british_thriller", genre:"British Thriller", title:"Killer in the Kremlin",           author:"John Sweeney",      year:2022, rating:4.2, nyt:false, tags:["Putin","Russia","Nonfiction"] },
+  { id:617, cat:"british_thriller", genre:"British Thriller", title:"The Housemaid",                   author:"Freida McFadden",   year:2022, rating:4.2, nyt:true,  tags:["Psychological","Domestic","Suspense"] },
+  { id:618, cat:"british_thriller", genre:"British Thriller", title:"The Maidens",                     author:"Alex Michaelides",  year:2021, rating:3.9, nyt:true,  tags:["Psychological","Cambridge","Mystery"] },
+  { id:619, cat:"british_thriller", genre:"British Thriller", title:"The Family Upstairs",             author:"Lisa Jewell",       year:2019, rating:4.0, nyt:true,  tags:["British Thriller","Cult","Mystery"] },
+  { id:620, cat:"british_thriller", genre:"British Thriller", title:"29 Seconds",                      author:"T.M. Logan",        year:2019, rating:4.0, nyt:false, tags:["British Thriller","Blackmail","Suspense"] },
+  { id:621, cat:"british_thriller", genre:"British Thriller", title:"A Gentleman in Moscow",           author:"Amor Towles",       year:2016, rating:4.4, nyt:true,  tags:["Russia","Literary","Historical"] },
+  { id:622, cat:"british_thriller", genre:"British Thriller", title:"The Accidental Billionaires",     author:"Ben Mezrich",       year:2009, rating:3.9, nyt:true,  tags:["Facebook","True Story","Tech"] },
+  { id:623, cat:"british_thriller", genre:"British Thriller", title:"NYPD Red",                        author:"James Patterson",   year:2012, rating:3.9, nyt:true,  tags:["NYPD","Crime","NYC"] },
+  { id:624, cat:"british_thriller", genre:"British Thriller", title:"NYPD Red 2",                      author:"James Patterson",   year:2014, rating:3.9, nyt:true,  tags:["NYPD","Crime","NYC"] },
+  { id:625, cat:"british_thriller", genre:"British Thriller", title:"The First Lady",                  author:"James Patterson",   year:2018, rating:3.9, nyt:true,  tags:["Political","White House","Thriller"] },
+  { id:626, cat:"british_thriller", genre:"British Thriller", title:"Eleventh Hour",                   author:"Catherine Coulter", year:2002, rating:4.0, nyt:true,  tags:["FBI","Serial Killer","Sherlock"] },
+
+  // NON-FICTION
+  { id:701, cat:"nonfiction", genre:"Non-Fiction", title:"All the President's Men",     author:"Woodward & Bernstein", year:1974, rating:4.3, nyt:true,  tags:["Watergate","Classic","Journalism"] },
+  { id:702, cat:"nonfiction", genre:"Non-Fiction", title:"Enemy at the Gates",          author:"William Craig",        year:1973, rating:4.4, nyt:false, tags:["Stalingrad","WWII","History"] },
+  { id:703, cat:"nonfiction", genre:"Non-Fiction", title:"Mein Kampf",                  author:"Adolf Hitler",         year:1925, rating:2.5, nyt:false, tags:["Historical","Reference","Controversial"] },
+  { id:704, cat:"nonfiction", genre:"Non-Fiction", title:"He Was My Chief",             author:"Christa Schroeder",    year:1985, rating:4.0, nyt:false, tags:["Hitler","WWII","Secretary Memoir"] },
+  { id:705, cat:"nonfiction", genre:"Non-Fiction", title:"Stalin",                      author:"Edvard Radzinsky",     year:1996, rating:4.2, nyt:false, tags:["Stalin","USSR","Biography"] },
+  { id:706, cat:"nonfiction", genre:"Non-Fiction", title:"My Life",                     author:"Bill Clinton",         year:2004, rating:4.0, nyt:true,  tags:["Memoir","Presidency","Clinton"] },
+  { id:707, cat:"nonfiction", genre:"Non-Fiction", title:"Decision Points",             author:"George W. Bush",       year:2010, rating:4.0, nyt:true,  tags:["Memoir","Presidency","Bush"] },
+  { id:708, cat:"nonfiction", genre:"Non-Fiction", title:"What Happened",               author:"Hillary Clinton",      year:2017, rating:3.8, nyt:true,  tags:["Memoir","Election","Clinton"] },
+  { id:709, cat:"nonfiction", genre:"Non-Fiction", title:"Becoming",                    author:"Michelle Obama",       year:2018, rating:4.5, nyt:true,  tags:["Memoir","Inspirational","Obama"] },
+  { id:710, cat:"nonfiction", genre:"Non-Fiction", title:"A Promised Land",             author:"Barack Obama",         year:2020, rating:4.4, nyt:true,  tags:["Memoir","Presidency","Obama"] },
+  { id:711, cat:"nonfiction", genre:"Non-Fiction", title:"Landslide: Final Days of Trump", author:"Michael Wolff",    year:2021, rating:3.8, nyt:true,  tags:["Trump","White House","Politics"] },
+  { id:712, cat:"nonfiction", genre:"Non-Fiction", title:"A Journey",                   author:"Tony Blair",           year:2010, rating:3.8, nyt:true,  tags:["Memoir","UK PM","Politics"] },
+  { id:713, cat:"nonfiction", genre:"Non-Fiction", title:"The Churchill Factor",        author:"Boris Johnson",        year:2014, rating:4.1, nyt:false, tags:["Churchill","Biography","WWII"] },
+  { id:714, cat:"nonfiction", genre:"Non-Fiction", title:"The Iron Lady",               author:"John Campbell",        year:2009, rating:4.1, nyt:false, tags:["Thatcher","Biography","UK Politics"] },
+  { id:715, cat:"nonfiction", genre:"Non-Fiction", title:"I Am Malala",                 author:"Malala Yousafzai",     year:2013, rating:4.3, nyt:true,  tags:["Memoir","Education","Pakistan"] },
+  { id:716, cat:"nonfiction", genre:"Non-Fiction", title:"Brotherhood of the Bomb",     author:"Gregg Herken",         year:2002, rating:4.1, nyt:false, tags:["Manhattan Project","Nuclear","History"] },
+  { id:717, cat:"nonfiction", genre:"Non-Fiction", title:"Countdown 1945",              author:"Chris Wallace",        year:2020, rating:4.3, nyt:true,  tags:["Atomic Bomb","WWII","History"] },
+  { id:718, cat:"nonfiction", genre:"Non-Fiction", title:"Collapse: Fall of Soviet Union", author:"Vladislav Zubok",  year:2021, rating:4.3, nyt:false, tags:["USSR","Cold War","History"] },
+  { id:719, cat:"nonfiction", genre:"Non-Fiction", title:"Profiles in Corruption",      author:"Peter Schweizer",      year:2020, rating:3.9, nyt:true,  tags:["Politics","Democrats","Corruption"] },
+  { id:720, cat:"nonfiction", genre:"Non-Fiction", title:"Punishing Putin",             author:"Unknown",              year:2022, rating:4.0, nyt:false, tags:["Russia","Sanctions","Ukraine"] },
+  { id:721, cat:"nonfiction", genre:"Non-Fiction", title:"One Vote Away",               author:"Ted Cruz",             year:2020, rating:3.9, nyt:true,  tags:["Supreme Court","Constitution","Politics"] },
+  { id:722, cat:"nonfiction", genre:"Non-Fiction", title:"Blood and Oil",               author:"Bradley Hope",         year:2020, rating:4.1, nyt:true,  tags:["MBS","Saudi Arabia","Nonfiction"] },
+  { id:723, cat:"nonfiction", genre:"Non-Fiction", title:"Death: An Inside Story",      author:"Sadhguru",             year:2020, rating:4.3, nyt:false, tags:["Spirituality","Philosophy","India"] },
+  { id:724, cat:"nonfiction", genre:"Non-Fiction", title:"The Nixon Conspiracy",        author:"Geoff Shepard",        year:2021, rating:4.0, nyt:false, tags:["Nixon","Watergate","History"] },
+  { id:725, cat:"nonfiction", genre:"Non-Fiction", title:"The Ambuja Story",            author:"Narotam Sekhsaria",    year:2020, rating:4.1, nyt:false, tags:["Business","India","Entrepreneurship"] },
+
+  // SELF-HELP
+  { id:801, cat:"self_help", genre:"Self-Help", title:"How to Win Friends and Influence People", author:"Dale Carnegie",   year:1936, rating:4.2, nyt:true,  tags:["Classic","Communication","Relationships"] },
+  { id:802, cat:"self_help", genre:"Self-Help", title:"Rich Dad Poor Dad",                       author:"Robert Kiyosaki", year:1997, rating:4.1, nyt:true,  tags:["Finance","Investing","Mindset"] },
+  { id:803, cat:"self_help", genre:"Self-Help", title:"How to Talk to Anyone",                   author:"Leil Lowndes",    year:1999, rating:3.9, nyt:false, tags:["Communication","Social Skills","Confidence"] },
+  { id:804, cat:"self_help", genre:"Self-Help", title:"Words That Change Minds",                 author:"Shelle Laborde",  year:1995, rating:4.0, nyt:false, tags:["Communication","NLP","Influence"] },
+  { id:805, cat:"self_help", genre:"Self-Help", title:"You Can Win",                             author:"Shiv Khera",      year:1998, rating:4.0, nyt:false, tags:["Motivation","India","Success"] },
+  { id:806, cat:"self_help", genre:"Self-Help", title:"Boundaries",                              author:"Henry Cloud",      year:1992, rating:4.2, nyt:false, tags:["Relationships","Psychology","Christian"] },
+  { id:807, cat:"self_help", genre:"Self-Help", title:"You Are a Badass",                        author:"Jen Sincero",      year:2013, rating:3.9, nyt:true,  tags:["Motivation","Confidence","Mindset"] },
+  { id:808, cat:"self_help", genre:"Self-Help", title:"The Courage to Be Disliked",              author:"Kishimi & Koga",   year:2013, rating:4.2, nyt:false, tags:["Philosophy","Psychology","Adler"] },
+  { id:809, cat:"self_help", genre:"Self-Help", title:"Exactly What to Say",                     author:"Phil M. Jones",    year:2017, rating:4.0, nyt:false, tags:["Sales","Communication","Influence"] },
+  { id:810, cat:"self_help", genre:"Self-Help", title:"Finish What You Start",                   author:"Peter Hollins",    year:2018, rating:3.9, nyt:false, tags:["Productivity","Follow-Through","Discipline"] },
+  { id:811, cat:"self_help", genre:"Self-Help", title:"Atomic Habits",                           author:"James Clear",      year:2018, rating:4.4, nyt:true,  tags:["Habits","Productivity","Mindset"] },
+  { id:812, cat:"self_help", genre:"Self-Help", title:"Unf*ck Yourself",                         author:"Gary John Bishop", year:2016, rating:3.9, nyt:true,  tags:["Mindset","Motivation","Self-Improvement"] },
+];
+function StarRating({ rating }) {
+  const full = Math.floor(rating), half = rating % 1 >= 0.5;
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:2}}>
+      {[1,2,3,4,5].map(i=>(
+        <span key={i} style={{fontSize:12,color:i<=full?"#c08b20":i===full+1&&half?"#c08b20":"#ccc"}}>
+          {i<=full?"★":i===full+1&&half?"⯨":"☆"}
+        </span>
+      ))}
+      <span style={{fontSize:11,color:"#8a8fa8",marginLeft:3}}>{Number(rating).toFixed(1)}</span>
+    </div>
+  );
+}
+
+function BookCard({ book, onToggleRead, onToggleWishlist, onDelete }) {
+  const cat = CATEGORIES.find(c=>c.id===book.cat);
+  const col = CAT_COLORS[book.cat] || CAT_COLORS.british_thriller;
+  return (
+    <div style={{background:"#faf9f7",border:`1px solid ${col.border}`,borderTop:`3px solid ${col.accent}`,borderRadius:12,overflow:"hidden",transition:"transform .15s,box-shadow .15s",position:"relative",display:"flex",flexDirection:"column",boxShadow:"0 1px 3px rgba(0,0,0,.06)"}}
+      onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-3px)";e.currentTarget.style.boxShadow="0 6px 20px rgba(0,0,0,.10)"}}
+      onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.boxShadow="0 1px 3px rgba(0,0,0,.06)"}}>
+      <div style={{position:"absolute",top:10,right:10,display:"flex",flexDirection:"column",gap:3,alignItems:"flex-end"}}>
+        {book.nyt&&<span style={{background:"#8b2e2e",color:"#fff",fontSize:8,padding:"2px 6px",borderRadius:20,fontWeight:800}}>NYT</span>}
+        {book.read&&<span style={{background:"#28622a",color:"#fff",fontSize:8,padding:"2px 6px",borderRadius:20,fontWeight:700}}>READ</span>}
+        {book.wishlist&&!book.read&&<span style={{background:"#8a4a18",color:"#fff",fontSize:8,padding:"2px 6px",borderRadius:20,fontWeight:700}}>LIST</span>}
+      </div>
+      <div style={{padding:"14px 14px 0",flex:1}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+          <span style={{fontSize:9,color:col.accent,textTransform:"uppercase",letterSpacing:1.5,fontFamily:"monospace",fontWeight:700}}>{cat?.emoji} {cat?.label}</span>
+          <span style={{fontSize:9,background:col.tag,color:col.tagText,padding:"1px 6px",borderRadius:10,fontWeight:600}}>{book.year}</span>
+        </div>
+        <div
+          onClick={()=>{
+            const q=encodeURIComponent(book.title+" "+book.author);
+            window._grBook=book;
+            const url="https://www.goodreads.com/search?q="+q;
+            const w=Math.min(520,window.innerWidth-40);
+            const h=Math.min(680,window.innerHeight-60);
+            const left=(window.innerWidth-w)/2;
+            const top=(window.innerHeight-h)/2;
+            window.open(url,"goodreads","width="+w+",height="+h+",left="+left+",top="+top+",scrollbars=yes,resizable=yes");
+          }}
+          style={{fontSize:14,fontWeight:700,color:"#2c2c2c",lineHeight:1.25,marginBottom:3,paddingRight:48,cursor:"pointer",textDecoration:"underline",textDecorationColor:"#ccc8c0",textUnderlineOffset:3}}
+          title="Click to view on Goodreads"
+        >{book.title} <span style={{fontSize:9,color:"#9a9aaa",fontWeight:400}}>↗</span></div>
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+          <span style={{fontSize:11,color:"#7a7a8a"}}>by {book.author}</span>
+        </div>
+        {book.genre&&<span style={{display:"inline-block",fontSize:9,background:col.tag,color:col.accent,padding:"2px 8px",borderRadius:20,fontWeight:700,letterSpacing:0.3,marginBottom:6,border:`1px solid ${col.border}`}}>{book.genre}</span>}
+        <StarRating rating={book.rating}/>
+        <div style={{display:"flex",flexWrap:"wrap",gap:4,margin:"8px 0 12px"}}>
+          {(book.tags||[]).map(t=><span key={t} style={{background:col.tag,color:col.tagText,fontSize:9,padding:"2px 7px",borderRadius:20,fontWeight:500}}>{t}</span>)}
+        </div>
+      </div>
+      <div style={{display:"flex",borderTop:`1px solid ${col.border}`}}>
+        <button onClick={()=>onToggleRead(book.id)} style={{flex:1,padding:"8px 0",background:book.read?"#edf5ee":"none",border:"none",color:book.read?"#28622a":"#a0a0b0",cursor:"pointer",fontSize:11,fontWeight:600}}>{book.read?"✓ Read":"Mark Read"}</button>
+        <button onClick={()=>onToggleWishlist(book.id)} style={{flex:1,padding:"8px 0",background:book.wishlist?"#f5ede8":"none",border:"none",borderLeft:`1px solid ${col.border}`,borderRight:`1px solid ${col.border}`,color:book.wishlist?"#8a4a18":"#a0a0b0",cursor:"pointer",fontSize:11,fontWeight:600}}>{book.wishlist?"♥ Listed":"+ Wishlist"}</button>
+        <button onClick={()=>onDelete(book.id)} style={{width:32,background:"none",border:"none",color:"#c8c8d0",cursor:"pointer",fontSize:14}}
+          onMouseEnter={e=>e.currentTarget.style.color="#b04040"} onMouseLeave={e=>e.currentTarget.style.color="#c8c8d0"}>×</button>
+      </div>
+    </div>
+  );
+}
+
+function AuthorDropdown({ books, selectedAuthor, onChange }) {
+  const [open,setOpen]=useState(false);
+  const ref=useRef(null);
+  const authorList=useMemo(()=>{
+    const map={};
+    books.forEach(b=>{map[b.author]=(map[b.author]||0)+1;});
+    return [["All Authors",books.length],...Object.entries(map).sort((a,b)=>a[0].localeCompare(b[0]))];
+  },[books]);
+  useEffect(()=>{
+    const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false)};
+    document.addEventListener("mousedown",h);return()=>document.removeEventListener("mousedown",h);
+  },[]);
+  return (
+    <div ref={ref} style={{position:"relative",zIndex:50}}>
+      <button onClick={()=>setOpen(o=>!o)} style={{background:"#faf9f7",border:"1px solid #ccc8c0",borderRadius:10,padding:"9px 14px",color:"#3a3a4a",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:8,minWidth:180,justifyContent:"space-between"}}>
+        <span>👤 {selectedAuthor==="all"?"All Authors":selectedAuthor}</span>
+        <span style={{color:"#9a9aaa",fontSize:10}}>{open?"▲":"▼"}</span>
+      </button>
+      {open&&(
+        <div style={{position:"absolute",top:"calc(100% + 4px)",left:0,background:"#faf9f7",border:"1px solid #ccc8c0",borderRadius:12,boxShadow:"0 8px 30px rgba(0,0,0,.13)",maxHeight:300,overflowY:"auto",minWidth:220,zIndex:200}}>
+          {authorList.map(([author,count])=>{
+            const val=author==="All Authors"?"all":author;
+            const active=selectedAuthor===val;
+            return (
+              <div key={author} onClick={()=>{onChange(val);setOpen(false)}}
+                style={{padding:"9px 16px",cursor:"pointer",display:"flex",justifyContent:"space-between",background:active?"#edeaf5":"transparent",color:active?"#342058":"#3a3a4a",fontWeight:active?700:400,fontSize:13,borderBottom:"1px solid #eee8e0"}}
+                onMouseEnter={e=>{if(!active)e.currentTarget.style.background="#f0ede8"}}
+                onMouseLeave={e=>{if(!active)e.currentTarget.style.background="transparent"}}>
+                <span>{author}</span>
+                <span style={{fontSize:11,color:"#9a9aaa",background:"#e8e4dc",padding:"1px 7px",borderRadius:20}}>{count}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Add Book Modal ──
+function AddBookModal({ onClose, onAdd, existingBooks }) {
+  const [titleInput,setTitleInput]=useState("");
+  const [loading,setLoading]=useState(false);
+  const [preview,setPreview]=useState(null);
+  const [error,setError]=useState("");
+  const [added,setAdded]=useState(false);
+  const inputRef=useRef(null);
+  useEffect(()=>{setTimeout(()=>inputRef.current?.focus(),80);},[]);
+
+  const fetchDetails=async()=>{
+    const title=titleInput.trim();
+    if(!title)return;
+    if(existingBooks.some(b=>b.title.toLowerCase()===title.toLowerCase())){
+      setError("Already in your library.");return;
+    }
+    setLoading(true);setError("");setPreview(null);
+    try {
+      const prompt=`Look up the book titled: ${title}
+Return ONLY a raw JSON object. No markdown. No explanation. No backticks.
+Fields required: title, author, year (number), rating (number like 4.2), nyt (true or false), genre, series (string or null), synopsis (2 sentences), tags (array of 3 strings), cat, found (true).
+For cat use exactly one of: vince_flynn, michael_connelly, harlan_coben, david_baldacci, indian, spy_espionage, british_thriller, nonfiction, self_help.
+If book is unknown return: {"found":false,"message":"not found"}
+Your response must start with { and end with }. Nothing before or after.`;
+      const text=await callClaude(prompt,800);
+      const s=text.indexOf("{"),e=text.lastIndexOf("}");
+      if(s===-1||e===-1)throw new Error("No JSON found in response");
+      const parsed=JSON.parse(text.slice(s,e+1));
+      if(!parsed.found){setError(parsed.message||"Book not found.");}
+      else{setPreview(parsed);}
+    }catch(e){setError(""+e.message);}
+    setLoading(false);
+  };
+
+  const handleAdd=(wishlist)=>{
+    onAdd({id:Date.now()+Math.random(),cat:preview.cat||"british_thriller",title:preview.title,author:preview.author,year:preview.year,rating:preview.rating,nyt:preview.nyt||false,tags:preview.tags||[],read:false,wishlist});
+    setAdded(true);setTimeout(onClose,800);
+  };
+  const col=preview?(CAT_COLORS[preview.cat]||CAT_COLORS.british_thriller):CAT_COLORS.british_thriller;
+  const cat=preview?CATEGORIES.find(c=>c.id===preview.cat):null;
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.38)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{background:"#faf9f7",border:"1px solid #d8d4cc",borderRadius:18,padding:28,width:"100%",maxWidth:520,boxShadow:"0 20px 60px rgba(0,0,0,.18)",maxHeight:"90vh",overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
+          <div>
+            <div style={{fontSize:9,color:"#6a4015",letterSpacing:3,textTransform:"uppercase",fontFamily:"monospace",fontWeight:700,marginBottom:5}}>◆ ADD A BOOK</div>
+            <div style={{fontSize:18,fontWeight:900,color:"#1e1e2a"}}>Add to Your Library</div>
+            <div style={{fontSize:12,color:"#9a9aaa",marginTop:3}}>Type a title — AI will fetch all the details</div>
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#9a9aaa",fontSize:22,cursor:"pointer"}}>×</button>
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:6}}>
+          <input ref={inputRef} value={titleInput} onChange={e=>{setTitleInput(e.target.value);setError("");setPreview(null);setAdded(false)}}
+            onKeyDown={e=>e.key==="Enter"&&!loading&&fetchDetails()}
+            placeholder="e.g. The Thursday Murder Club…"
+            style={{flex:1,background:"#f0ede8",border:"1.5px solid #ccc8c0",borderRadius:10,padding:"11px 14px",color:"#1e1e2a",fontSize:14,outline:"none"}}/>
+          <button onClick={fetchDetails} disabled={loading||!titleInput.trim()}
+            style={{background:loading?"#c0bcb4":"#7a3530",border:"none",borderRadius:10,padding:"11px 18px",color:"#fff",fontWeight:700,cursor:loading?"default":"pointer",fontSize:13,minWidth:80}}>
+            {loading?"⟳":"Fetch"}
+          </button>
+        </div>
+        <div style={{fontSize:11,color:"#9a9aaa",marginBottom:18}}>Press Enter or click Fetch to look up the book</div>
+        {loading&&<div style={{textAlign:"center",padding:"24px 0"}}><div style={{fontSize:28,animation:"spin 1s linear infinite",display:"inline-block"}}>◎</div><div style={{color:"#9a9aaa",fontSize:13,marginTop:8}}>Fetching details…</div></div>}
+        {error&&<div style={{background:"#f5eeee",border:"1px solid #d4b8b5",borderRadius:10,padding:"12px 16px",color:"#7a3530",fontSize:13,marginBottom:12}}>⚠️ {error}</div>}
+        {preview&&!loading&&(
+          <div style={{background:col.bg,border:`1px solid ${col.border}`,borderTop:`3px solid ${col.accent}`,borderRadius:14,padding:"18px 20px",animation:"fadeIn .3s ease"}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginBottom:8}}>
+              {cat&&<span style={{fontSize:9,color:col.accent,textTransform:"uppercase",letterSpacing:1.5,fontFamily:"monospace",fontWeight:700}}>{cat.emoji} {cat.label}</span>}
+              <span style={{fontSize:9,background:col.tag,color:col.tagText,padding:"1px 6px",borderRadius:10,fontWeight:600}}>{preview.year}</span>
+              {preview.nyt&&<span style={{background:"#8b2e2e",color:"#fff",fontSize:8,padding:"2px 6px",borderRadius:20,fontWeight:800}}>NYT</span>}
+              {preview.series&&<span style={{fontSize:9,color:"#9a9aaa",background:"#ede9e2",padding:"2px 8px",borderRadius:20}}>{preview.series}</span>}
+            </div>
+            <div style={{fontSize:18,fontWeight:900,color:"#1e1e2a",lineHeight:1.2,marginBottom:3}}>{preview.title}</div>
+            <div style={{fontSize:12,color:"#7a7a8a",marginBottom:8}}>by {preview.author}</div>
+            <div style={{marginBottom:8}}><StarRating rating={preview.rating}/></div>
+            <div style={{fontSize:12,color:"#4a4a5a",lineHeight:1.6,marginBottom:12,background:"rgba(255,255,255,.6)",borderRadius:8,padding:"10px 12px",borderLeft:`3px solid ${col.accent}40`}}>{preview.synopsis}</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:18}}>
+              {(preview.tags||[]).map(t=><span key={t} style={{background:col.tag,color:col.tagText,fontSize:9,padding:"2px 8px",borderRadius:20}}>{t}</span>)}
+            </div>
+            {!added?(
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>handleAdd(false)} style={{flex:1,background:col.accent,border:"none",borderRadius:10,padding:"11px 0",color:"#fff",fontWeight:800,cursor:"pointer",fontSize:13}}>+ Add to Library</button>
+                <button onClick={()=>handleAdd(true)} style={{flex:1,background:"#faf9f7",border:`1.5px solid ${col.accent}`,borderRadius:10,padding:"11px 0",color:col.accent,fontWeight:700,cursor:"pointer",fontSize:13}}>♥ Wishlist</button>
+              </div>
+            ):(
+              <div style={{textAlign:"center",padding:"10px 0",color:"#28622a",fontWeight:700}}>✓ Added!</div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── AI Discover Modal ──
+function AIModal({ onClose, onAdd }) {
+  const [loading,setLoading]=useState(false);
+  const [results,setResults]=useState([]);
+  const [query,setQuery]=useState("");
+  const [error,setError]=useState("");
+  const fetchBooks=async(prompt)=>{
+    setLoading(true);setError("");setResults([]);
+    try{
+      const p=`Book expert. Return ONLY a raw JSON array of 5 highly-rated books matching: ${prompt}
+No markdown, no backticks. Each item: title, author, year (number), rating (3.8-4.8), tags (3 strings), cat (one of: vince_flynn,michael_connelly,harlan_coben,david_baldacci,indian,spy_espionage,british_thriller,nonfiction,self_help), nyt (boolean).
+Start with [ end with ]. Nothing else.`;
+      const text=await callClaude(p,1200);
+      const s=text.indexOf("["),e=text.lastIndexOf("]");
+      if(s===-1||e===-1)throw new Error("No JSON array in response");
+      const books=JSON.parse(text.slice(s,e+1));
+      setResults(books.map((b,i)=>({...b,id:Date.now()+i,read:false,wishlist:false})));
+    }catch(e){setError(""+e.message);}
+    setLoading(false);
+  };
+  const suggestions=["More Vince Flynn Mitch Rapp","More Harlan Coben standalones","Indian RAW intelligence thrillers","Daniel Silva Gabriel Allon series","More Harry Bosch Connelly","More Amos Decker Baldacci"];
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.35)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{background:"#faf9f7",border:"1px solid #d8d4cc",borderRadius:18,padding:28,width:"100%",maxWidth:560,maxHeight:"82vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.18)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div><div style={{fontSize:19,fontWeight:800,color:"#2c2c3a"}}>✦ AI Book Finder</div><div style={{fontSize:12,color:"#9a9aaa",marginTop:2}}>Discover more books for your library</div></div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#9a9aaa",fontSize:22,cursor:"pointer"}}>×</button>
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <input value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={e=>e.key==="Enter"&&query&&fetchBooks(query)} placeholder="e.g. More Brad Thor CIA thrillers..."
+            style={{flex:1,background:"#f0ede8",border:"1px solid #ccc8c0",borderRadius:10,padding:"10px 14px",color:"#2c2c3a",fontSize:13,outline:"none"}}/>
+          <button onClick={()=>query&&fetchBooks(query)} style={{background:"#7a3530",border:"none",borderRadius:10,padding:"10px 18px",color:"#fff",fontWeight:700,cursor:"pointer",fontSize:13}}>Search</button>
+        </div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:20}}>
+          {suggestions.map(s=><button key={s} onClick={()=>{setQuery(s);fetchBooks(s)}} style={{background:"#edeae4",border:"1px solid #ccc8c0",borderRadius:20,padding:"5px 11px",color:"#4a4a5a",fontSize:10,cursor:"pointer"}}>{s}</button>)}
+        </div>
+        {loading&&<div style={{textAlign:"center",padding:32,color:"#9a9aaa"}}><div style={{fontSize:28,animation:"spin 1s linear infinite",display:"inline-block"}}>⟳</div></div>}
+        {error&&<div style={{color:"#7a3530",padding:16,fontSize:13}}>⚠️ {error}</div>}
+        {results.map(book=>{
+          const col=CAT_COLORS[book.cat]||CAT_COLORS.british_thriller;
+          const cat=CATEGORIES.find(c=>c.id===book.cat);
+          return(
+            <div key={book.id} style={{background:col.bg,border:`1px solid ${col.border}`,borderTop:`2px solid ${col.accent}`,borderRadius:10,padding:14,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"start"}}>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}>
+                    <span style={{fontSize:10,color:col.accent,fontWeight:700}}>{cat?.emoji} {cat?.label}</span>
+                    {book.nyt&&<span style={{background:"#8b2e2e",color:"#fff",fontSize:8,padding:"1px 5px",borderRadius:10,fontWeight:800}}>NYT</span>}
+                    <span style={{background:col.tag,color:col.tagText,fontSize:9,padding:"1px 6px",borderRadius:10}}>{book.year}</span>
+                  </div>
+                  <div style={{fontSize:14,fontWeight:700,color:"#2c2c3a"}}>{book.title}</div>
+                  <div style={{fontSize:11,color:"#7a7a8a",marginBottom:3}}>by {book.author}</div>
+                  <StarRating rating={book.rating}/>
+                </div>
+                <button onClick={()=>onAdd(book)} style={{background:col.accent,border:"none",borderRadius:8,padding:"7px 12px",color:"#fff",fontWeight:700,cursor:"pointer",fontSize:11,marginLeft:10}}>+ Add</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Countdown Timer ──
+function CountdownTimer({ nextRefresh }) {
+  const [t,setT]=useState("");
+  useEffect(()=>{
+    const upd=()=>{const d=nextRefresh-new Date();if(d<=0){setT("Refreshing…");return;}setT(Math.floor(d/3600000)+"h "+Math.floor((d%3600000)/60000)+"m");};
+    upd();const id=setInterval(upd,60000);return()=>clearInterval(id);
+  },[nextRefresh]);
+  return <span>{t}</span>;
+}
+
+// ── Recommendations Tab ──
+function RecommendationsTab({ onAddToLibrary }) {
+  const win=useMemo(()=>getTwoDayWindow(),[]);
+  const [data,setData]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [error,setError]=useState("");
+
+  const loadRecs=async(force=false)=>{
+    const key="recs_"+win.seed;
+    if(!force&&window._recCache&&window._recCache.key===key){setData(window._recCache.data);return;}
+    setLoading(true);setError("");
+    try{
+      const text=await callClaude("Today: "+new Date().toISOString().split("T")[0]+". Batch #"+win.seed+".\n"+REC_PROMPT,2200);
+      const s=text.indexOf("{"),e=text.lastIndexOf("}");
+      if(s===-1||e===-1)throw new Error("No JSON found");
+      const parsed=JSON.parse(text.slice(s,e+1));
+      if(!parsed.picks)throw new Error("Missing picks in response");
+      window._recCache={key,data:parsed};
+      setData(parsed);
+    }catch(e){setError(""+e.message);}
+    setLoading(false);
+  };
+  useEffect(()=>{loadRecs();},[]);
+
+  return(
+    <div style={{maxWidth:860,margin:"0 auto",padding:"24px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:12,marginBottom:22}}>
+        <div>
+          <div style={{fontSize:9,color:"#6a4015",textTransform:"uppercase",letterSpacing:3,fontFamily:"monospace",fontWeight:700,marginBottom:6}}>◆ CURATED FOR YOUR LIBRARY</div>
+          <div style={{fontSize:20,fontWeight:900,color:"#1e1e2a"}}>{data?.headline||"Personalised Reading Picks"}</div>
+          <div style={{fontSize:12,color:"#9a9aaa",marginTop:3}}>Based on your reading profile · Refreshes every 48 hours</div>
+        </div>
+        <div style={{background:"#edeae4",border:"1px solid #d0ccc4",borderRadius:12,padding:"10px 16px",textAlign:"right"}}>
+          <div style={{fontSize:9,color:"#9a9aaa",textTransform:"uppercase",letterSpacing:1.5,marginBottom:3}}>Next refresh</div>
+          <div style={{fontSize:17,fontWeight:800,color:"#342058"}}><CountdownTimer nextRefresh={win.nextRefresh}/></div>
+        </div>
+      </div>
+      <div style={{background:"#faf9f7",border:"1px solid #d8d4cc",borderRadius:12,padding:"14px 18px",marginBottom:22}}>
+        <div style={{fontSize:9,color:"#6a4015",textTransform:"uppercase",letterSpacing:2.5,fontFamily:"monospace",fontWeight:700,marginBottom:10}}>Your Reading DNA</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+          {[...LIBRARY_PROFILE.series,...LIBRARY_PROFILE.themes].map(tag=>(
+            <span key={tag} style={{background:"#ede9e2",color:"#4a4a5a",fontSize:10,padding:"3px 10px",borderRadius:20,border:"1px solid #d8d4cc"}}>{tag}</span>
+          ))}
+        </div>
+      </div>
+      {loading&&<div style={{textAlign:"center",padding:"50px 0"}}><div style={{fontSize:34,animation:"spin 1.2s linear infinite",display:"inline-block",marginBottom:14}}>◎</div><div style={{color:"#9a9aaa",fontSize:14}}>Analysing your library…</div></div>}
+      {error&&(
+        <div style={{background:"#f5eeee",border:"1px solid #d4b8b5",borderRadius:12,padding:"20px 24px",textAlign:"center"}}>
+          <div style={{fontSize:22,marginBottom:8}}>⚠️</div>
+          <div style={{color:"#7a3530",fontSize:13,fontWeight:600,marginBottom:12,wordBreak:"break-word"}}>{error}</div>
+          <button onClick={()=>loadRecs(true)} style={{background:"#7a3530",border:"none",borderRadius:8,padding:"9px 20px",color:"#fff",fontWeight:700,cursor:"pointer",fontSize:13}}>Try Again</button>
+        </div>
+      )}
+      {data&&!loading&&(
+        <>
+          <div style={{display:"flex",justifyContent:"flex-end",marginBottom:14}}>
+            <button onClick={()=>loadRecs(true)} style={{background:"none",border:"1px solid #d0ccc4",borderRadius:8,padding:"6px 14px",color:"#6a6a7a",fontSize:11,cursor:"pointer"}}>↻ Refresh now</button>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {(data.picks||[]).map((pick,i)=>{
+              const mc=MOOD_COLORS[pick.mood]||MOOD_COLORS["Action-Packed"];
+              const cc=CAT_COLORS[pick.cat]||CAT_COLORS.british_thriller;
+              const cat=CATEGORIES.find(c=>c.id===pick.cat);
+              const [added,setAdded]=useState(false);
+              return(
+                <div key={i} style={{background:"#faf9f7",border:`1px solid #d8d4cc`,borderLeft:`4px solid ${mc.accent}`,borderRadius:12,padding:"16px 18px",display:"flex",gap:14}}>
+                  <div style={{minWidth:28,height:28,borderRadius:"50%",background:mc.bg,border:`1.5px solid ${mc.accent}40`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,color:mc.accent,flexShrink:0}}>{i+1}</div>
+                  <div style={{flex:1}}>
+                    <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginBottom:4}}>
+                      <span style={{fontSize:9,background:mc.bg,color:mc.accent,border:`1px solid ${mc.accent}40`,padding:"2px 8px",borderRadius:20,fontWeight:700,textTransform:"uppercase"}}>{pick.mood}</span>
+                      {pick.nyt&&<span style={{fontSize:8,background:"#8b2e2e",color:"#fff",padding:"2px 6px",borderRadius:20,fontWeight:800}}>NYT</span>}
+                      {cat&&<span style={{fontSize:9,background:cc.tag,color:cc.tagText,padding:"2px 7px",borderRadius:20}}>{cat.emoji} {cat.label}</span>}
+                    </div>
+                    <div style={{fontSize:15,fontWeight:800,color:"#1e1e2a",marginBottom:2}}>{pick.title}</div>
+                    <div style={{fontSize:11,color:"#7a7a8a",marginBottom:6}}>{pick.author} · {pick.year} · <span style={{color:"#c08b20",fontWeight:700}}>★ {Number(pick.rating).toFixed(1)}</span></div>
+                    <div style={{fontSize:12,color:"#5a5a6a",fontStyle:"italic",marginBottom:10}}>"{pick.why}"</div>
+                    <button onClick={()=>{if(!added){onAddToLibrary({id:Date.now()+i,cat:pick.cat||"british_thriller",title:pick.title,author:pick.author,year:pick.year,rating:pick.rating,nyt:pick.nyt||false,tags:[pick.genre,pick.mood].filter(Boolean),read:false,wishlist:false});setAdded(true);}}}
+                      style={{background:added?"#e8e4dc":mc.accent,border:"none",borderRadius:8,padding:"6px 14px",color:added?"#9a9aaa":"#fff",fontWeight:700,cursor:added?"default":"pointer",fontSize:11}}>
+                      {added?"✓ Added":"+ Add to Library"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {data.spotlightAuthor&&(
+            <div style={{background:"linear-gradient(135deg,#f5efea 0%,#eeecf5 100%)",border:"1px solid #ccc8c0",borderTop:"3px solid #6a4015",borderRadius:14,padding:"20px 22px",marginTop:24}}>
+              <div style={{fontSize:9,color:"#6a4015",textTransform:"uppercase",letterSpacing:3,fontFamily:"monospace",fontWeight:700,marginBottom:10}}>✦ Author Spotlight</div>
+              <div style={{fontSize:20,fontWeight:900,color:"#1e1e2a",marginBottom:2}}>{data.spotlightAuthor.name}</div>
+              <div style={{fontSize:11,color:"#9a9aaa",marginBottom:10}}>{data.spotlightAuthor.booksCount} books in catalogue</div>
+              <div style={{fontSize:13,color:"#4a4a5a",lineHeight:1.6,marginBottom:14}}>{data.spotlightAuthor.why}</div>
+              <div style={{background:"#faf9f7",border:"1px solid #d8d4cc",borderRadius:10,padding:"14px 18px",display:"inline-block"}}>
+                <div style={{fontSize:9,color:"#9a9aaa",textTransform:"uppercase",letterSpacing:2,marginBottom:4}}>Must-Read First</div>
+                <div style={{fontSize:14,fontWeight:800,color:"#342058"}}>"{data.spotlightAuthor.mustRead}"</div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+function LibraryTab({ books, setBooks }) {
+  const [activeCat,setActiveCat]=useState("all");
+  const [activeFilter,setActiveFilter]=useState("all");
+  const [selectedAuthor,setSelectedAuthor]=useState("all");
+  const [search,setSearch]=useState("");
+  const [showAI,setShowAI]=useState(false);
+  const [showAdd,setShowAdd]=useState(false);
+  const [selectedGenre,setSelectedGenre]=useState("all");
+  const [selectedYear,setSelectedYear]=useState("all");
+
+  const filtered=useMemo(()=>books.filter(b=>{
+    if(activeCat!=="all"&&b.cat!==activeCat)return false;
+    if(activeFilter==="read"&&!b.read)return false;
+    if(activeFilter==="wishlist"&&!b.wishlist)return false;
+    if(activeFilter==="unread"&&b.read)return false;
+    if(activeFilter==="nyt"&&!b.nyt)return false;
+    if(selectedAuthor!=="all"&&b.author!==selectedAuthor)return false;
+    if(search){const q=search.toLowerCase();if(!b.title.toLowerCase().includes(q)&&!b.author.toLowerCase().includes(q)&&!b.tags.some(t=>t.toLowerCase().includes(q)))return false;}
+    if(selectedGenre!=="all"&&b.genre!==selectedGenre)return false;
+    if(selectedYear!=="all"){
+      const [from,to]=selectedYear.split("-").map(Number);
+      if(b.year<from||b.year>to)return false;
+    }
+    return true;
+  }).sort((a,b)=>a.author.localeCompare(b.author)||a.year-b.year),[books,activeCat,activeFilter,selectedAuthor,search,selectedGenre,selectedYear]);
+
+  const catCounts=useMemo(()=>Object.fromEntries(CATEGORIES.map(c=>[c.id,books.filter(b=>b.cat===c.id).length])),[books]);
+  const toggleRead=id=>setBooks(bs=>bs.map(b=>b.id===id?{...b,read:!b.read}:b));
+  const toggleWishlist=id=>setBooks(bs=>bs.map(b=>b.id===id?{...b,wishlist:!b.wishlist}:b));
+  const deleteBook=id=>setBooks(bs=>bs.filter(b=>b.id!==id));
+  const addBook=book=>{setBooks(bs=>[{...book,id:Date.now()+Math.random(),...(!book.read&&{read:false}),...(!book.wishlist&&{wishlist:false})},bs.filter(b=>b.title.toLowerCase()!==book.title.toLowerCase())].flat());setShowAI(false);setShowAdd(false);};
+
+  const authorGroups=useMemo(()=>{
+    const g={};
+    filtered.forEach(b=>{if(!g[b.author])g[b.author]=[];g[b.author].push(b);});
+    return Object.entries(g).sort(([a],[b])=>a.localeCompare(b));
+  },[filtered]);
+
+  return(
+    <div style={{maxWidth:1400,margin:"0 auto",padding:"16px 24px"}}>
+      {showAI&&<AIModal onClose={()=>setShowAI(false)} onAdd={addBook}/>}
+      {showAdd&&<AddBookModal onClose={()=>setShowAdd(false)} onAdd={addBook} existingBooks={books}/>}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:14}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍  Search title, author or tag…"
+          style={{background:"#faf9f7",border:"1px solid #ccc8c0",borderRadius:10,padding:"9px 14px",color:"#2c2c3a",fontSize:13,outline:"none",width:240}}/>
+        <AuthorDropdown books={books} selectedAuthor={selectedAuthor} onChange={setSelectedAuthor}/>
+        <select value={selectedGenre} onChange={e=>setSelectedGenre(e.target.value)}
+          style={{background:"#faf9f7",border:"1px solid #ccc8c0",borderRadius:10,padding:"9px 14px",color:"#3a3a4a",fontSize:13,cursor:"pointer",outline:"none",boxShadow:"0 1px 3px rgba(0,0,0,.06)"}}>
+          <option value="all">🎭 All Genres</option>
+          {GENRES.map(g=><option key={g} value={g}>{g}</option>)}
+        </select>
+        <select value={selectedYear} onChange={e=>setSelectedYear(e.target.value)}
+          style={{background:"#faf9f7",border:"1px solid #ccc8c0",borderRadius:10,padding:"9px 14px",color:"#3a3a4a",fontSize:13,cursor:"pointer",outline:"none",boxShadow:"0 1px 3px rgba(0,0,0,.06)"}}>
+          <option value="all">📅 All Years</option>
+          <option value="1800-1999">Before 2000</option>
+          <option value="2000-2004">2000 – 2004</option>
+          <option value="2005-2009">2005 – 2009</option>
+          <option value="2010-2014">2010 – 2014</option>
+          <option value="2015-2019">2015 – 2019</option>
+          <option value="2020-2025">2020 – 2025</option>
+        </select>
+        <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+          <button onClick={()=>setShowAdd(true)} style={{background:"#28502a",border:"none",borderRadius:10,padding:"9px 18px",color:"#fff",fontWeight:700,cursor:"pointer",fontSize:13}}>+ Add Book</button>
+          <button onClick={()=>setShowAI(true)} style={{background:"#7a3530",border:"none",borderRadius:10,padding:"9px 18px",color:"#fff",fontWeight:700,cursor:"pointer",fontSize:13}}>✦ AI Discover</button>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+        <button onClick={()=>setActiveCat("all")} style={{padding:"5px 13px",borderRadius:20,border:`1.5px solid ${activeCat==="all"?"#7a3530":"#ccc8c0"}`,background:activeCat==="all"?"#ede0df":"#faf9f7",color:activeCat==="all"?"#7a3530":"#6a6a7a",cursor:"pointer",fontSize:11,fontWeight:600}}>All ({books.length})</button>
+        {CATEGORIES.map(c=>{const col=CAT_COLORS[c.id];const active=activeCat===c.id;return(
+          <button key={c.id} onClick={()=>setActiveCat(c.id)} style={{padding:"5px 13px",borderRadius:20,border:`1.5px solid ${active?col.accent:"#ccc8c0"}`,background:active?col.bg:"#faf9f7",color:active?col.accent:"#6a6a7a",cursor:"pointer",fontSize:11,fontWeight:600}}>
+            {c.emoji} {c.label} ({catCounts[c.id]||0})
+          </button>
+        );})}
+      </div>
+      <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:22}}>
+        {[["all","All"],["read","Read"],["unread","Unread"],["wishlist","Wishlist"],["nyt","NYT Only"]].map(([f,l])=>(
+          <button key={f} onClick={()=>setActiveFilter(f)} style={{padding:"4px 12px",borderRadius:20,border:"1px solid #ccc8c0",background:activeFilter===f?"#e8e4dc":"#faf9f7",color:activeFilter===f?"#3a3a4a":"#9a9aaa",cursor:"pointer",fontSize:11,fontWeight:activeFilter===f?600:400}}>{l}</button>
+        ))}
+        <span style={{marginLeft:"auto",color:"#9a9aaa",fontSize:11}}>{filtered.length} books{selectedGenre!=="all"?" · "+selectedGenre:""}{selectedYear!=="all"?" · "+selectedYear:""} · sorted by author → year</span>
+      </div>
+      {filtered.length===0?(
+        <div style={{textAlign:"center",padding:60,color:"#9a9aaa"}}><div style={{fontSize:40}}>📭</div><div style={{marginTop:10,fontSize:14}}>No books match.</div></div>
+      ):(
+        authorGroups.map(([author,abooks])=>{
+          const col=CAT_COLORS[abooks[0].cat]||CAT_COLORS.british_thriller;
+          return(
+            <div key={author} style={{marginBottom:36}}>
+              <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:14}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{width:3,height:18,background:col.accent,borderRadius:2}}/>
+                  <div style={{fontSize:14,fontWeight:800,color:"#2c2c3a",letterSpacing:-0.3}}>{author}</div>
+                </div>
+                <div style={{flex:1,height:1,background:"#d8d4cc"}}/>
+                <div style={{fontSize:11,color:"#9a9aaa"}}>{abooks.length} book{abooks.length!==1?"s":""}</div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(215px,1fr))",gap:12}}>
+                {abooks.map(book=><BookCard key={book.id} book={book} onToggleRead={toggleRead} onToggleWishlist={toggleWishlist} onDelete={deleteBook}/>)}
+              </div>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+function AuthScreen({ onAuth }) {
+  const [mode, setMode] = useState("login"); // login | signup | forgot
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  const handle = async () => {
+    setLoading(true); setError(""); setMessage("");
+    try {
+      if (mode === "signup") {
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        setMessage("✓ Check your email to confirm your account, then log in.");
+        setMode("login");
+      } else if (mode === "login") {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        onAuth(data.user);
+      } else if (mode === "forgot") {
+        const { error } = await supabase.auth.resetPasswordForEmail(email);
+        if (error) throw error;
+        setMessage("✓ Password reset email sent!");
+      }
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{minHeight:"100vh",background:"#f0ede8",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{background:"#faf9f7",border:"1px solid #d8d4cc",borderRadius:20,padding:"36px 32px",width:"100%",maxWidth:400,boxShadow:"0 20px 60px rgba(0,0,0,.10)"}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
+          <div style={{fontSize:36,marginBottom:10}}>📚</div>
+          <div style={{fontSize:9,color:"#7a3530",letterSpacing:4,textTransform:"uppercase",fontFamily:"monospace",fontWeight:700,marginBottom:6}}>◆ PERSONAL READING VAULT</div>
+          <div style={{fontSize:22,fontWeight:900,color:"#1e1e2a"}}>My Book Library</div>
+          <div style={{fontSize:12,color:"#9a9aaa",marginTop:4}}>{mode==="signup"?"Create your account":mode==="forgot"?"Reset your password":"Welcome back"}</div>
+        </div>
+
+        {error && <div style={{background:"#f5eeee",border:"1px solid #d4b8b5",borderRadius:10,padding:"10px 14px",color:"#7a3530",fontSize:12,marginBottom:16}}>{error}</div>}
+        {message && <div style={{background:"#eaf2ea",border:"1px solid #b0ccb0",borderRadius:10,padding:"10px 14px",color:"#28622a",fontSize:12,marginBottom:16}}>{message}</div>}
+
+        <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:16}}>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)}
+            placeholder="Email address"
+            style={{background:"#f0ede8",border:"1.5px solid #ccc8c0",borderRadius:10,padding:"12px 14px",fontSize:14,outline:"none",color:"#1e1e2a"}}/>
+          {mode !== "forgot" && (
+            <input type="password" value={password} onChange={e=>setPassword(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&handle()}
+              placeholder="Password"
+              style={{background:"#f0ede8",border:"1.5px solid #ccc8c0",borderRadius:10,padding:"12px 14px",fontSize:14,outline:"none",color:"#1e1e2a"}}/>
+          )}
+        </div>
+
+        <button onClick={handle} disabled={loading}
+          style={{width:"100%",background:loading?"#c0bcb4":"#7a3530",border:"none",borderRadius:10,padding:"13px 0",color:"#fff",fontWeight:800,fontSize:14,cursor:loading?"default":"pointer",marginBottom:14}}>
+          {loading ? "⟳ Please wait…" : mode==="signup" ? "Create Account" : mode==="forgot" ? "Send Reset Email" : "Sign In"}
+        </button>
+
+        <div style={{display:"flex",justifyContent:"center",gap:16,fontSize:12,color:"#7a7a8a"}}>
+          {mode==="login" && <>
+            <span onClick={()=>{setMode("signup");setError("");setMessage("");}} style={{cursor:"pointer",color:"#7a3530",fontWeight:600}}>Create account</span>
+            <span>·</span>
+            <span onClick={()=>{setMode("forgot");setError("");setMessage("");}} style={{cursor:"pointer",color:"#7a3530"}}>Forgot password?</span>
+          </>}
+          {mode==="signup" && <span onClick={()=>{setMode("login");setError("");setMessage("");}} style={{cursor:"pointer",color:"#7a3530",fontWeight:600}}>← Back to sign in</span>}
+          {mode==="forgot" && <span onClick={()=>{setMode("login");setError("");setMessage("");}} style={{cursor:"pointer",color:"#7a3530",fontWeight:600}}>← Back to sign in</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ApiKeyBanner() {
+  const [key, setKey] = useState(() => localStorage.getItem('claude_api_key') || '');
+  const [input, setInput] = useState('');
+  const [show, setShow] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const hasKey = !!key;
+
+  const saveKey = () => {
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    localStorage.setItem('claude_api_key', trimmed);
+    window._claudeApiKey = trimmed;
+    setKey(trimmed);
+    setInput('');
+    setSaved(true);
+    setShow(false);
+    setTimeout(() => setSaved(false), 3000);
+  };
+
+  const removeKey = () => {
+    localStorage.removeItem('claude_api_key');
+    window._claudeApiKey = '';
+    setKey('');
+    setSaved(false);
+  };
+
+  // Sync to window on mount
+  useEffect(() => { if (key) window._claudeApiKey = key; }, []);
+
+  return (
+    <div style={{background: hasKey ? "#eaf2ea" : "#f5efea", borderBottom: "1px solid " + (hasKey ? "#b0ccb0" : "#cdb898"), padding:"10px 24px", fontSize:12}}>
+      <div style={{maxWidth:1400, margin:"0 auto", display:"flex", alignItems:"center", gap:12, flexWrap:"wrap"}}>
+        <span style={{fontSize:14}}>{hasKey ? "🔑" : "⚠️"}</span>
+        {hasKey ? (
+          <>
+            <span style={{color:"#28622a", fontWeight:600}}>API key set — AI features active</span>
+            {saved && <span style={{color:"#28622a"}}>✓ Saved!</span>}
+            <button onClick={removeKey} style={{background:"none", border:"1px solid #b0ccb0", borderRadius:6, padding:"3px 10px", color:"#6a8a6a", cursor:"pointer", fontSize:11}}>Remove key</button>
+          </>
+        ) : (
+          <>
+            <span style={{color:"#6a4015", fontWeight:600}}>Add Anthropic API key to enable AI features</span>
+            {!show ? (
+              <button onClick={() => setShow(true)} style={{background:"#7a3530", border:"none", borderRadius:6, padding:"4px 12px", color:"#fff", cursor:"pointer", fontSize:11, fontWeight:600}}>+ Add Key</button>
+            ) : (
+              <div style={{display:"flex", gap:6, alignItems:"center"}}>
+                <input
+                  type="password"
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && saveKey()}
+                  placeholder="sk-ant-..."
+                  style={{background:"#faf9f7", border:"1px solid #ccc8c0", borderRadius:6, padding:"5px 10px", fontSize:12, outline:"none", width:260}}
+                  autoFocus
+                />
+                <button onClick={saveKey} style={{background:"#7a3530", border:"none", borderRadius:6, padding:"5px 12px", color:"#fff", cursor:"pointer", fontSize:11, fontWeight:600}}>Save</button>
+                <button onClick={() => setShow(false)} style={{background:"none", border:"1px solid #ccc8c0", borderRadius:6, padding:"5px 10px", color:"#9a9aaa", cursor:"pointer", fontSize:11}}>Cancel</button>
+              </div>
+            )}
+            <a href="https://console.anthropic.com" target="_blank" style={{color:"#7a3530", fontSize:11, marginLeft:4}}>Get a free key →</a>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [activeTab,setActiveTab]=useState("library");
+  const [user,setUser]=useState(null);
+  const [authLoading,setAuthLoading]=useState(true);
+  const [syncing,setSyncing]=useState(false);
+  const [books,setBooks]=useState(()=>ALL_BOOKS.map(b=>({...b,read:false,wishlist:false})));
+
+  // Check auth on mount + listen for changes
+  useEffect(()=>{
+    supabase.auth.getSession().then(({data:{session}})=>{
+      if(session?.user){ setUser(session.user); loadAndMerge(session.user.id); }
+      setAuthLoading(false);
+    });
+    const {data:{subscription}}=supabase.auth.onAuthStateChange((_,session)=>{
+      if(session?.user){ setUser(session.user); loadAndMerge(session.user.id); }
+      else{ setUser(null); setBooks(ALL_BOOKS.map(b=>({...b,read:false,wishlist:false}))); }
+    });
+    return ()=>subscription.unsubscribe();
+  },[]);
+
+  const loadAndMerge=async(userId)=>{
+    setSyncing(true);
+    const saved=await loadStates(userId);
+    setBooks(()=>{
+      const extraBooks=Object.values(saved).filter(r=>r.extra_data?.isExtra).map(r=>r.extra_data.book).filter(Boolean);
+      const base=ALL_BOOKS.map(b=>({
+        ...b,
+        read:saved[String(b.id)]?.read||false,
+        wishlist:saved[String(b.id)]?.wishlist||false,
+        rating:saved[String(b.id)]?.rating||b.rating,
+      }));
+      const titles=new Set(base.map(b=>b.title.toLowerCase()));
+      const newBooks=extraBooks.filter(b=>!titles.has(b.title.toLowerCase()));
+      return [...newBooks,...base];
+    });
+    setSyncing(false);
+  };
+
+  const addToLibrary=book=>{
+    const newBook={...book,id:Date.now()+Math.random(),read:false,wishlist:false};
+    setBooks(bs=>{
+      if(bs.find(b=>b.title.toLowerCase()===newBook.title.toLowerCase()))return bs;
+      // Save to Supabase as extra book
+      if(user) saveState(user.id, String(newBook.id), false, false, newBook.rating, {isExtra:true, book:newBook});
+      return [newBook,...bs];
+    });
+    setActiveTab("library");
+  };
+  const stats=useMemo(()=>({total:books.length,read:books.filter(b=>b.read).length,wishlist:books.filter(b=>b.wishlist).length,nyt:books.filter(b=>b.nyt).length}),[books]);
+
+  // Supabase-synced toggle functions passed to LibraryTab
+  const syncedSetBooks=(updater)=>{
+    setBooks(prev=>{
+      const updated=updater(prev);
+      // Find what changed and sync to Supabase
+      if(user){
+        updated.forEach((b,i)=>{
+          const old=prev.find(o=>o.id===b.id);
+          if(old&&(old.read!==b.read||old.wishlist!==b.wishlist||old.rating!==b.rating)){
+            saveState(user.id,String(b.id),b.read,b.wishlist,b.rating,null);
+          }
+        });
+      }
+      return updated;
+    });
+  };
+
+  if(authLoading) return(
+    <div style={{minHeight:"100vh",background:"#f0ede8",display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{textAlign:"center"}}><div style={{fontSize:36,animation:"spin 1s linear infinite",display:"inline-block"}}>◎</div><div style={{color:"#9a9aaa",fontSize:14,marginTop:12}}>Loading…</div></div>
+    </div>
+  );
+
+  if(!user) return <AuthScreen onAuth={u=>{setUser(u);loadAndMerge(u.id);}}/>;
+
+  return(
+    <div style={{minHeight:"100vh",background:"#f0ede8",color:"#2c2c3a"}}>
+      <ApiKeyBanner/>
+      <div style={{background:"#f5f2ee",borderBottom:"1px solid #d8d4cc",padding:"18px 24px 0",boxShadow:"0 1px 4px rgba(0,0,0,.06)",position:"sticky",top:0,zIndex:100}}>
+        <div style={{maxWidth:1400,margin:"0 auto"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:14,marginBottom:14}}>
+            <div>
+              <div style={{fontSize:9,color:"#7a3530",letterSpacing:4,textTransform:"uppercase",fontFamily:"monospace",fontWeight:700,marginBottom:4}}>◆ PERSONAL READING VAULT</div>
+              <h1 style={{fontSize:22,fontWeight:900,margin:0,color:"#1e1e2a"}}>My Book Library {syncing&&<span style={{fontSize:10,color:"#9a9aaa",fontWeight:400,marginLeft:6}}>⟳ syncing…</span>}</h1>
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+              <button onClick={()=>supabase.auth.signOut()} style={{background:"none",border:"1px solid #ccc8c0",borderRadius:8,padding:"5px 12px",color:"#9a9aaa",cursor:"pointer",fontSize:11}}>Sign out</button>
+              {[["📚",stats.total,"Total","#edeaf5","#342058"],["✓",stats.read,"Read","#eaf2ea","#28622a"],["♥",stats.wishlist,"Wishlist","#f2ebe6","#8a4a18"],["📰",stats.nyt,"NYT","#f2e8e8","#8b2e2e"]].map(([icon,val,label,bg,color])=>(
+                <div key={label} style={{background:bg,border:`1px solid ${color}30`,borderRadius:9,padding:"6px 12px",textAlign:"center",minWidth:52}}>
+                  <div style={{fontSize:12}}>{icon}</div><div style={{fontSize:16,fontWeight:800,color}}>{val}</div><div style={{fontSize:8,color:"#9a9aaa",textTransform:"uppercase",letterSpacing:1}}>{label}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:0}}>
+            {[{id:"library",label:"📖 My Library",count:books.length},{id:"recommendations",label:"✦ Recommendations",count:null}].map(tab=>(
+              <button key={tab.id} onClick={()=>setActiveTab(tab.id)} style={{padding:"10px 22px",background:"none",border:"none",borderBottom:`3px solid ${activeTab===tab.id?"#7a3530":"transparent"}`,color:activeTab===tab.id?"#7a3530":"#9a9aaa",fontWeight:activeTab===tab.id?800:500,fontSize:13,cursor:"pointer",marginBottom:-1,display:"flex",alignItems:"center",gap:6}}>
+                {tab.label}
+                {tab.count!==null&&<span style={{background:activeTab===tab.id?"#ede0df":"#e8e4dc",color:activeTab===tab.id?"#7a3530":"#9a9aaa",fontSize:10,padding:"1px 7px",borderRadius:20,fontWeight:700}}>{tab.count}</span>}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      {activeTab==="library"&&<LibraryTab books={books} setBooks={syncedSetBooks}/>}
+      {activeTab==="recommendations"&&<RecommendationsTab onAddToLibrary={addToLibrary}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js')
+      .then(r => console.log('SW registered'))
+      .catch(e => console.log('SW failed:', e));
+  });
+}
+</script>
+</body>
+</html>
