@@ -345,7 +345,8 @@ function AuthorDropdown({ books, selectedAuthor, onChange }) {
     </div>
   );
 }
-
+</script>
+<script type="text/babel" data-presets="react,env">
 // ── Add Book Modal ──
 function AddBookModal({ onClose, onAdd, existingBooks }) {
   const [titleInput,setTitleInput]=useState("");
@@ -439,7 +440,8 @@ Your response must start with { and end with }. Nothing before or after.`;
     </div>
   );
 }
-
+</script>
+<script type="text/babel" data-presets="react,env">
 // ── Add Author Modal ──
 function AddAuthorModal({ onClose, onAddAll, existingBooks }) {
   const [query, setQuery]       = useState("");
@@ -618,6 +620,8 @@ Return the complete list sorted by year ascending.`;
 }
 
 // ── AI Discover Modal ──
+</script>
+<script type="text/babel" data-presets="react,env">
 function AIModal({ onClose, onAdd }) {
   const [loading,setLoading]=useState(false);
   const [results,setResults]=useState([]);
@@ -692,6 +696,8 @@ function CountdownTimer({ nextRefresh }) {
 }
 
 // ── Recommendations Tab ──
+</script>
+<script type="text/babel" data-presets="react,env">
 function RecommendationsTab({ onAddToLibrary }) {
   const win=useMemo(()=>getTwoDayWindow(),[]);
   const [data,setData]=useState(null);
@@ -1074,7 +1080,8 @@ function ApiKeyBanner() {
     </div>
   );
 }
-
+</script>
+<script type="text/babel" data-presets="react,env">
 function App() {
   const [activeTab,setActiveTab]=useState("library");
   const [user,setUser]=useState(null);
